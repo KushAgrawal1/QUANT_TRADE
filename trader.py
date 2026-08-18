@@ -1,74 +1,17 @@
 """
 trader.py — Final Momentum Breakout System
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RESEARCH BASIS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Donchian Channel Breakout (BTC 2022-2026): +36.5% returns,
-36% win rate — profits entirely from large winners.
-— CoinQuant Backtests (2026)
-
-Adding volume confirmation: win rate 52% → 58%
-Adding ADX>25 filter on top: win rate → 63%
-— arxum.com comprehensive backtests (2026)
-
-ADX>25 filter improves win rate by 25% across all assets.
-— Fazen Capital Research (2026)
-
-Using ADX for EXITS (not just entries): RET/DD 3.42 → 6.12
-"Same market. Same core entry. Smarter exit logic."
-— Alpha Algo Trading Research (2026)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STRATEGY SUMMARY
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Candles : 3-minute OHLCV (from ticks) — better than 1-min
-Assets  : 10 crypto (24/7) + 4 stocks (market hours)
-
-ENTRY — 4 conditions ALL required:
-  1. ADX > 25 AND rising     → market is trending (not choppy)
-  2. Price > 15-candle high  → Donchian breakout above resistance
-  3. Volume > 1.5× average   → institutional backing
-  4. EMA(9) > EMA(21)        → short-term uptrend confirmed
-  + For stocks only: price > VWAP (institutional flow bullish)
-
-EXIT — whichever hits first:
-  A. Profit target: +3.0 × ATR (2:1 R:R minimum)
-  B. Stop loss:     -1.5 × ATR
-  C. Breakeven:     stop moves to entry after +1.5 ATR profit
-  D. ADX exit:      ADX drops below 20 while at breakeven (trend dying)
-
-SHORTS (stocks only — Alpaca paper supports it):
-  Same 4 conditions but inverted: breakdown below 15-candle LOW
-
-SIZING:
-  Risk 1% of capital per trade, stop at 1.5×ATR
-  Hard cap: $10,000 notional per trade
-  Always floor qty to 4dp (never round up — avoids Alpaca errors)
-
-PORTFOLIO LIMITS:
-  Max 3 concurrent positions
-  5% drawdown → full halt
-  3-candle cooldown per asset after each trade
-
-MATH:
-  With 40% win rate, 2:1 R:R:
-  EV = (0.40 × 3 ATR) − (0.60 × 1.5 ATR) = +0.3 ATR per trade
-  Positive expected value even losing 60% of trades.
-
-  With 63% win rate (ADX-filtered, research-backed):
-  EV = (0.63 × 3 ATR) − (0.37 × 1.5 ATR) = +1.335 ATR per trade
-  Much stronger positive expectancy.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-WARMUP: 25 × 3-minute candles = 75 minutes
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Fixes in this version:
+  1. ADX bug fixed (values now correctly 0-100, not 0-800)
+  2. Instant warmup — fetches 35 historical 3-min candles from:
+       Kraken REST API  → crypto (free, no auth)
+       Alpaca Data API  → stocks (uses your existing keys)
+     No more waiting 75 minutes for warmup.
 """
 
 import os
 import json
+import requests
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
@@ -96,26 +39,41 @@ CRYPTO_ASSETS = ["BTC", "ETH", "SOL", "DOGE", "LTC", "XRP", "ADA", "AVAX", "LINK
 STOCK_ASSETS  = ["AAPL", "NVDA", "TSLA", "AMZN"]
 ALL_ASSETS    = CRYPTO_ASSETS + STOCK_ASSETS
 
-CANDLE_MINUTES  = 3       # 3-min candles — better quality than 1-min
-CANDLE_WINDOW   = 80      # candles stored per asset
-CANDLES_NEEDED  = 25      # warmup = 25 × 3min = 75 minutes
+CANDLE_MINUTES  = 3
+CANDLE_WINDOW   = 80
+CANDLES_NEEDED  = 30      # need 30 so ADX(14) has 29 minimum (period*2+1)
+WARMUP_CANDLES  = 35      # fetch 35 from API — extra buffer
 
-DONCHIAN_PERIOD  = 15     # 15-candle high/low = 45-minute range
-VOLUME_PERIOD    = 15     # volume average period
-VOLUME_THRESHOLD = 1.5    # 150% of average = confirmed institutional move
+DONCHIAN_PERIOD  = 15
+VOLUME_PERIOD    = 15
+VOLUME_THRESHOLD = 1.5
 
-ADX_THRESHOLD  = 25       # ADX must be above 25 (strong trend)
-ADX_EXIT_LEVEL = 20       # exit early if ADX drops below 20 while profitable
+ADX_THRESHOLD  = 25
+ADX_EXIT_LEVEL = 20
 
 STOP_ATR_MULT   = 1.5
 TARGET_ATR_MULT = 3.0
 
 RISK_PER_TRADE  = 0.01
-MAX_NOTIONAL    = 10_000.0   # max $10k per trade
+MAX_NOTIONAL    = 10_000.0
 MAX_POSITIONS   = 3
 MAX_DRAWDOWN    = 0.05
 INITIAL_CAPITAL = 100_000.0
 CANDLE_COOLDOWN = 3
+
+# Kraken REST pair names (different from WebSocket names)
+KRAKEN_REST_PAIRS = {
+    "BTC":  "XBTUSD",
+    "ETH":  "ETHUSD",
+    "SOL":  "SOLUSD",
+    "DOGE": "XDGUSD",
+    "LTC":  "LTCUSD",
+    "XRP":  "XRPUSD",
+    "ADA":  "ADAUSD",
+    "AVAX": "AVAXUSD",
+    "LINK": "LINKUSD",
+    "DOT":  "DOTUSD",
+}
 
 
 def to_alpaca_symbol(asset: str) -> str:
@@ -123,31 +81,132 @@ def to_alpaca_symbol(asset: str) -> str:
 
 
 def is_us_market_hours() -> bool:
-    """9:45 AM - 3:30 PM Eastern Time, Mon-Fri."""
-    utc  = datetime.now(timezone.utc)
-    ny   = utc + timedelta(hours=-4)   # EDT (summer)
+    utc = datetime.now(timezone.utc)
+    ny  = utc + timedelta(hours=-4)
     if ny.weekday() >= 5:
         return False
     return ny.replace(hour=9, minute=45) <= ny <= ny.replace(hour=15, minute=30)
 
 
 def floor_qty(qty: float) -> float:
-    """Always floor to 4dp — never round up. Prevents 'insufficient balance' errors."""
     return int(qty * 10000) / 10000
 
 
-# ── 3-Minute Candle Builder ───────────────────────────────────────────────────
+# ── Instant Warmup — Fetch Historical Candles from APIs ───────────────────────
+
+def warmup_crypto(engine) -> int:
+    """
+    Fetch 1-min candles from Kraken and aggregate into 3-min candles.
+    Kraken supports: 1, 5, 15, 30, 60 min — NOT 3 min directly.
+    """
+    print("Fetching crypto history from Kraken REST API...")
+    warmed = 0
+
+    for coin, pair in KRAKEN_REST_PAIRS.items():
+        try:
+            url    = "https://api.kraken.com/0/public/OHLC"
+            params = {"pair": pair, "interval": 1}   # 1-min candles
+            resp   = requests.get(url, params=params, timeout=10)
+            data   = resp.json()
+
+            if data.get("error") and data["error"]:
+                print(f"  ✗ {coin}: {data['error']}")
+                continue
+
+            result_key  = [k for k in data["result"].keys() if k != "last"][0]
+            raw_candles = data["result"][result_key]
+
+            # Aggregate every 3 one-minute candles into one 3-minute candle
+            three_min = []
+            # Use most recent complete 1-min candles, skip last (may be incomplete)
+            usable = raw_candles[:-1]
+            # Align to 3-minute boundaries
+            i = len(usable) - 1
+            group = []
+            while i >= 0 and len(three_min) < WARMUP_CANDLES:
+                group.insert(0, usable[i])
+                if len(group) == 3:
+                    three_min.insert(0, {
+                        "open":   float(group[0][1]),
+                        "high":   max(float(c[2]) for c in group),
+                        "low":    min(float(c[3]) for c in group),
+                        "close":  float(group[-1][4]),
+                        "volume": sum(float(c[6]) for c in group),
+                    })
+                    group = []
+                i -= 1
+
+            for candle in three_min:
+                engine.add_candle(coin, candle)
+
+            print(f"  ✓ {coin:<5} loaded {len(three_min)} candles | "
+                  f"last close=${three_min[-1]['close']:,.4f}")
+            warmed += 1
+
+        except Exception as e:
+            print(f"  ✗ {coin}: {e}")
+
+    return warmed
+
+def warmup_stocks(engine) -> int:
+    """
+    Fetch last 35 three-minute bars from Alpaca Data API.
+    Uses your existing API keys from .env
+    Returns number of assets successfully warmed up.
+    """
+    api_key    = os.getenv("ALPACA_API_KEY")
+    secret_key = os.getenv("ALPACA_SECRET_KEY")
+
+    if not api_key or not secret_key:
+        print("  ✗ Stocks: no API keys found in .env")
+        return 0
+
+    print("\nFetching stock history from Alpaca Data API...")
+    warmed  = 0
+    headers = {
+        "APCA-API-KEY-ID":     api_key,
+        "APCA-API-SECRET-KEY": secret_key,
+    }
+
+    for stock in STOCK_ASSETS:
+        try:
+            url    = f"https://data.alpaca.markets/v2/stocks/{stock}/bars"
+            params = {
+                "timeframe": "3Min",
+                "limit":     WARMUP_CANDLES,
+                "feed":      "iex",    # free IEX feed
+                "sort":      "asc",
+            }
+            resp = requests.get(url, headers=headers, params=params, timeout=10)
+            data = resp.json()
+            bars = data.get("bars", [])
+
+            if not bars:
+                print(f"  ✗ {stock}: no data returned (market may be closed)")
+                continue
+
+            for bar in bars:
+                engine.add_candle(stock, {
+                    "open":   bar["o"],
+                    "high":   bar["h"],
+                    "low":    bar["l"],
+                    "close":  bar["c"],
+                    "volume": bar["v"],
+                })
+
+            print(f"  ✓ {stock:<5} loaded {len(bars)} bars | "
+                  f"last close=${bars[-1]['c']:,.3f}")
+            warmed += 1
+
+        except Exception as e:
+            print(f"  ✗ {stock}: {e}")
+
+    return warmed
+
+
+# ── Candle Builder ────────────────────────────────────────────────────────────
 
 class CandleBuilder:
-    """
-    Aggregates ticks into 3-minute OHLCV candles.
-    3-min chosen over 1-min because research shows:
-    - Higher timeframe = more institutional order flow
-    - Less microstructure noise
-    - Better follow-through on breakouts
-    Still fast enough to generate multiple trades per session.
-    """
-
     def __init__(self):
         self.current = {}
 
@@ -158,7 +217,6 @@ class CandleBuilder:
 
     def update(self, asset: str, price: float, volume: float = 0) -> dict | None:
         key = self._key()
-
         if asset not in self.current or self.current[asset]["key"] != key:
             completed = None
             if asset in self.current:
@@ -169,7 +227,6 @@ class CandleBuilder:
                 "low": price, "close": price, "volume": volume,
             }
             return completed
-
         c = self.current[asset]
         c["high"]    = max(c["high"], price)
         c["low"]     = min(c["low"],  price)
@@ -178,32 +235,20 @@ class CandleBuilder:
         return None
 
 
-# ── VWAP Tracker (for stocks only) ───────────────────────────────────────────
+# ── VWAP Tracker ─────────────────────────────────────────────────────────────
 
 class VWAPTracker:
-    """
-    Volume Weighted Average Price — resets each trading day.
-    Represents where institutions have been trading on average.
-    Price > VWAP = institutions bullish → only buy.
-    Price < VWAP = institutions bearish → only short.
-    Research: PyQuantLab (2025) — VWAP flow filter as institutional alignment.
-    """
-
     def __init__(self):
         self.data = {}
 
     def update(self, asset: str, candle: dict) -> float | None:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
         if asset not in self.data or self.data[asset]["date"] != today:
             self.data[asset] = {"cum_pv": 0.0, "cum_vol": 0.0, "date": today}
-
         typical = (candle["high"] + candle["low"] + candle["close"]) / 3
         vol     = candle.get("volume", 0)
-
         self.data[asset]["cum_pv"]  += typical * vol
         self.data[asset]["cum_vol"] += vol
-
         if self.data[asset]["cum_vol"] > 0:
             return round(self.data[asset]["cum_pv"] / self.data[asset]["cum_vol"], 4)
         return None
@@ -212,20 +257,6 @@ class VWAPTracker:
 # ── Signal Engine ─────────────────────────────────────────────────────────────
 
 class SignalEngine:
-    """
-    4-filter breakout scanner backed by research.
-
-    Filter hierarchy (remove these in order if you want more trades):
-      1. ADX > 25 AND rising  — most important, biggest win rate impact
-      2. Donchian breakout    — core signal
-      3. Volume > 1.5x        — institutional confirmation
-      4. EMA trend alignment  — direction filter
-      5. VWAP alignment       — stocks only, institutional flow
-
-    The ADX filter alone eliminates ~60-70% of false breakouts in ranging
-    markets. That's why it was the #1 improvement from all research papers.
-    """
-
     def __init__(self):
         self.closes  = {a: deque(maxlen=CANDLE_WINDOW) for a in ALL_ASSETS}
         self.highs   = {a: deque(maxlen=CANDLE_WINDOW) for a in ALL_ASSETS}
@@ -250,75 +281,48 @@ class SignalEngine:
         lows    = list(self.lows[asset])
         volumes = list(self.volumes[asset])
 
-        # ── Compute indicators ──────────────────────────────────────────────
-
-        # ADX — the gatekeeper
         adx_val, adx_rising = ind.adx(highs, lows, closes)
+        don_high, don_low   = ind.donchian_channel(highs[:-1], lows[:-1], period=DONCHIAN_PERIOD)
+        vol_r               = ind.volume_ratio(volumes, period=VOLUME_PERIOD)
+        e9                  = ind.ema(closes, 9)
+        e21                 = ind.ema(closes, 21)
+        atr_val             = ind.atr(highs, lows, closes)
 
-        # Donchian channel (exclude current candle)
-        don_high, don_low = ind.donchian_channel(
-            highs[:-1], lows[:-1], period=DONCHIAN_PERIOD
-        )
+        trend_ok    = bool(adx_val and adx_val > ADX_THRESHOLD and adx_rising)
+        breakout_up = bool(don_high and current_price > don_high)
+        breakout_dn = bool(don_low  and current_price < don_low)
+        vol_ok      = bool(vol_r and vol_r >= VOLUME_THRESHOLD)
+        ema_up      = bool(e9 and e21 and e9 > e21)
+        ema_dn      = bool(e9 and e21 and e9 < e21)
 
-        # Volume ratio
-        vol_r = ind.volume_ratio(volumes, period=VOLUME_PERIOD)
-
-        # EMA trend
-        e9  = ind.ema(closes, 9)
-        e21 = ind.ema(closes, 21)
-
-        # ATR for stop/target
-        atr_val = ind.atr(highs, lows, closes)
-
-        # ── Evaluate conditions ─────────────────────────────────────────────
-
-        trend_ok     = bool(adx_val and adx_val > ADX_THRESHOLD and adx_rising)
-        breakout_up  = bool(don_high and current_price > don_high)
-        breakout_dn  = bool(don_low  and current_price < don_low)
-        vol_ok       = bool(vol_r and vol_r >= VOLUME_THRESHOLD)
-        ema_up       = bool(e9 and e21 and e9 > e21)
-        ema_dn       = bool(e9 and e21 and e9 < e21)
-
-        # VWAP check (stocks only)
-        above_vwap = bool(vwap and current_price > vwap)
-        below_vwap = bool(vwap and current_price < vwap)
+        above_vwap      = bool(vwap and current_price > vwap)
+        below_vwap      = bool(vwap and current_price < vwap)
         vwap_check_buy  = (above_vwap if asset in STOCK_ASSETS else True)
         vwap_check_sell = (below_vwap if asset in STOCK_ASSETS else True)
 
-        # ── Determine signal ────────────────────────────────────────────────
-
         is_crypto = asset in CRYPTO_ASSETS
 
-        # BUY: all 4 filters aligned
         if trend_ok and breakout_up and vol_ok and ema_up and vwap_check_buy:
             signal = "BUY"
-
-        # SHORT: all 4 filters aligned, inverted (stocks only)
         elif (not is_crypto and
               trend_ok and breakout_dn and vol_ok and ema_dn and vwap_check_sell):
             signal = "SHORT"
-
         else:
             signal = "HOLD"
 
         return signal, {
-            "adx":       adx_val,
-            "adx_up":    adx_rising,
-            "don_high":  don_high,
-            "don_low":   don_low,
-            "vol_ratio": vol_r,
-            "e9":        e9,
-            "e21":       e21,
-            "atr":       atr_val,
-            "trend_ok":  trend_ok,
-            "breakout":  breakout_up or breakout_dn,
-            "vol_ok":    vol_ok,
-            "ema_ok":    ema_up or ema_dn,
-            "vwap":      vwap,
+            "adx": adx_val, "adx_up": adx_rising,
+            "don_high": don_high, "don_low": don_low,
+            "vol_ratio": vol_r, "e9": e9, "e21": e21,
+            "atr": atr_val,
+            "trend_ok": trend_ok,
+            "breakout": breakout_up or breakout_dn,
+            "vol_ok":   vol_ok,
+            "ema_ok":   ema_up or ema_dn,
+            "vwap":     vwap,
         }
 
     def adx_value(self, asset: str) -> float | None:
-        """Get current ADX for exit decisions."""
         closes = list(self.closes[asset])
         highs  = list(self.highs[asset])
         lows   = list(self.lows[asset])
@@ -329,58 +333,34 @@ class SignalEngine:
 # ── Trade Manager ─────────────────────────────────────────────────────────────
 
 class TradeManager:
-    """
-    Manages stops, targets, and the ADX-based smart exit.
-
-    Stage 0: Initial. Stop at -1.5 ATR. Target at +3 ATR.
-    Stage 1: After +1.5 ATR profit → stop moves to breakeven.
-             At this stage: also exit if ADX drops below 20
-             (trend is dying — lock in the free trade).
-    """
-
     def __init__(self):
         self.trades = {}
 
     def open(self, asset: str, entry: float, atr: float, direction: str = "LONG"):
-        stop   = entry - STOP_ATR_MULT   * atr if direction == "LONG" else entry + STOP_ATR_MULT   * atr
-        target = entry + TARGET_ATR_MULT * atr if direction == "LONG" else entry - TARGET_ATR_MULT * atr
-        be_trig = entry + STOP_ATR_MULT * atr  if direction == "LONG" else entry - STOP_ATR_MULT * atr
-
+        stop    = entry - STOP_ATR_MULT   * atr if direction == "LONG" else entry + STOP_ATR_MULT   * atr
+        target  = entry + TARGET_ATR_MULT * atr if direction == "LONG" else entry - TARGET_ATR_MULT * atr
+        be_trig = entry + STOP_ATR_MULT   * atr if direction == "LONG" else entry - STOP_ATR_MULT   * atr
         self.trades[asset] = {
-            "entry":      entry,
-            "stop":       stop,
-            "target":     target,
-            "be_trigger": be_trig,
-            "atr":        atr,
-            "direction":  direction,
-            "stage":      0,
+            "entry": entry, "stop": stop, "target": target,
+            "be_trigger": be_trig, "atr": atr,
+            "direction": direction, "stage": 0,
         }
-        risk   = abs(entry - stop)
-        reward = abs(target - entry)
-        print(
-            f"  [SET] {asset} {direction} | "
-            f"entry=${entry:,.4f} | "
-            f"stop=${stop:,.4f} (risk ${risk:,.2f}) | "
-            f"target=${target:,.4f} (reward ${reward:,.2f}) | "
-            f"R:R=2:1"
-        )
+        print(f"  [SET] {asset} {direction} | entry=${entry:,.4f} | "
+              f"stop=${stop:,.4f} (risk ${abs(entry-stop):,.2f}) | "
+              f"target=${target:,.4f} (reward ${abs(target-entry):,.2f}) | R:R=2:1")
 
     def update_breakeven(self, asset: str, price: float):
         if asset not in self.trades:
             return
         t = self.trades[asset]
         if t["stage"] == 0:
-            if t["direction"] == "LONG"  and price >= t["be_trigger"]:
+            if (t["direction"] == "LONG"  and price >= t["be_trigger"]) or \
+               (t["direction"] == "SHORT" and price <= t["be_trigger"]):
                 t["stop"]  = t["entry"]
                 t["stage"] = 1
-                print(f"  [BREAKEVEN] {asset} → stop moved to entry ${t['entry']:,.4f}")
-            elif t["direction"] == "SHORT" and price <= t["be_trigger"]:
-                t["stop"]  = t["entry"]
-                t["stage"] = 1
-                print(f"  [BREAKEVEN] {asset} → stop moved to entry ${t['entry']:,.4f}")
+                print(f"  [BREAKEVEN] {asset} → stop at entry ${t['entry']:,.4f}")
 
     def check_tick(self, asset: str, price: float) -> str:
-        """Called on every tick — real-time stop/target monitoring."""
         if asset not in self.trades:
             return "HOLD"
         t = self.trades[asset]
@@ -393,17 +373,9 @@ class TradeManager:
         return "HOLD"
 
     def check_adx_exit(self, asset: str, adx_val: float | None) -> bool:
-        """
-        Smart ADX exit: if we're at breakeven or better AND ADX drops
-        below 20, the trend is dying — exit now rather than give back profit.
-        Research: Alpha Algo Trading (2026) — ADX exits improved RET/DD by 79%.
-        """
-        if asset not in self.trades:
+        if asset not in self.trades or adx_val is None:
             return False
-        if adx_val is None:
-            return False
-        t = self.trades[asset]
-        return t["stage"] >= 1 and adx_val < ADX_EXIT_LEVEL
+        return self.trades[asset]["stage"] >= 1 and adx_val < ADX_EXIT_LEVEL
 
     def direction(self, asset: str) -> str:
         return self.trades.get(asset, {}).get("direction", "LONG")
@@ -447,17 +419,13 @@ class Portfolio:
         if self.has(asset):
             return False, "in position"
         if len(self.positions) >= MAX_POSITIONS:
-            return False, f"max {MAX_POSITIONS} positions"
+            return False, f"max {MAX_POSITIONS}"
         cd = self.cooldowns.get(asset, CANDLE_COOLDOWN)
         if cd < CANDLE_COOLDOWN:
             return False, f"cooldown ({CANDLE_COOLDOWN - cd})"
         return True, "ok"
 
     def position_qty(self, price: float, atr: float) -> float:
-        """
-        Volatility-adjusted sizing. Risk 1% of capital.
-        Hard cap at $10k notional. Always floor to avoid oversell errors.
-        """
         atr_safe = max(atr, price * 0.001)
         risk     = self.capital * RISK_PER_TRADE
         stop_d   = STOP_ATR_MULT * atr_safe
@@ -468,37 +436,24 @@ class Portfolio:
     def open(self, asset: str, qty: float, price: float, atr: float, direction: str):
         self.positions[asset] = {"qty": qty, "entry": price, "atr": atr, "direction": direction}
         self.cooldowns[asset] = 0
-        print(
-            f"\n  [OPEN] {asset:<5} {direction:<6} | qty={qty} | "
-            f"price=${price:,.4f} | "
-            f"open={len(self.positions)}/{MAX_POSITIONS}"
-        )
+        print(f"\n  [OPEN] {asset:<5} {direction:<6} | qty={qty} | "
+              f"price=${price:,.4f} | open={len(self.positions)}/{MAX_POSITIONS}")
 
     def close(self, asset: str, price: float, reason: str) -> float:
         if not self.has(asset):
             return 0
         pos = self.positions.pop(asset)
-        if pos["direction"] == "LONG":
-            pnl = (price - pos["entry"]) * pos["qty"]
-        else:
-            pnl = (pos["entry"] - price) * pos["qty"]
-
+        pnl = (price - pos["entry"]) * pos["qty"] if pos["direction"] == "LONG" \
+              else (pos["entry"] - price) * pos["qty"]
         self.total_pnl   += pnl
         self.capital     += pnl
         self.trade_count += 1
         self.wins   += 1 if pnl >= 0 else 0
         self.losses += 0 if pnl >= 0 else 1
-
         tag = "PROFIT" if pnl >= 0 else "LOSS  "
-        print(
-            f"\n  [CLOSE] {asset:<5} | "
-            f"entry=${pos['entry']:,.4f} → exit=${price:,.4f} | "
-            f"{tag}: ${pnl:+.2f} | "
-            f"running P&L: ${self.total_pnl:+.2f} | "
-            f"reason={reason}"
-        )
+        print(f"\n  [CLOSE] {asset:<5} | entry=${pos['entry']:,.4f} → exit=${price:,.4f} | "
+              f"{tag}: ${pnl:+.2f} | P&L: ${self.total_pnl:+.2f} | reason={reason}")
         self.cooldowns[asset] = 0
-
         if self.trade_count % 5 == 0:
             self.dashboard()
         return pnl
@@ -509,16 +464,15 @@ class Portfolio:
     def dashboard(self):
         wr = (self.wins / self.trade_count * 100) if self.trade_count else 0
         dd = max(0, (INITIAL_CAPITAL - self.capital) / INITIAL_CAPITAL * 100)
-        open_pos = {k: f"{v['direction']} {v['qty']}" for k, v in self.positions.items()}
-        print("\n" + "═" * 68)
-        print("  FINAL MOMENTUM TRADER — DASHBOARD")
-        print("═" * 68)
-        print(f"  Capital     : ${self.capital:>12,.2f}  (started ${INITIAL_CAPITAL:,.2f})")
-        print(f"  Total P&L   : ${self.total_pnl:>+12.2f}")
-        print(f"  Drawdown    : {dd:.2f}%")
-        print(f"  Trades      : {self.trade_count}  ({self.wins}W / {self.losses}L)  Win rate: {wr:.1f}%")
-        print(f"  Open        : {open_pos or 'None'}")
-        print("═" * 68 + "\n")
+        print("\n" + "═" * 65)
+        print("  MOMENTUM TRADER — DASHBOARD")
+        print("═" * 65)
+        print(f"  Capital  : ${self.capital:>12,.2f}  (started ${INITIAL_CAPITAL:,.2f})")
+        print(f"  P&L      : ${self.total_pnl:>+12.2f}")
+        print(f"  Drawdown : {dd:.2f}%")
+        print(f"  Trades   : {self.trade_count}  ({self.wins}W/{self.losses}L)  Win: {wr:.1f}%")
+        print(f"  Open     : {list(self.positions.keys()) or 'None'}")
+        print("═" * 65 + "\n")
 
 
 # ── Alpaca Executor ───────────────────────────────────────────────────────────
@@ -570,8 +524,6 @@ class FinalMomentumTrader:
     def _on_assign(self, consumer, partitions):
         print(f"  Partitions: {[p.partition for p in partitions]}\n")
 
-    # ── Open Position ─────────────────────────────────────────────────────────
-
     def _open(self, asset: str, price: float, atr: float, direction: str):
         can, reason = self.portfolio.can_open(asset)
         if not can:
@@ -582,38 +534,43 @@ class FinalMomentumTrader:
         qty = self.portfolio.position_qty(price, atr)
         if qty <= 0:
             return
-
         side = OrderSide.BUY if direction == "LONG" else OrderSide.SELL
         if self.alpaca._place(asset, qty, side):
             self.portfolio.open(asset, qty, price, atr, direction)
             self.trades.open(asset, price, atr, direction)
-
-    # ── Close Position ────────────────────────────────────────────────────────
 
     def _close(self, asset: str, price: float, reason: str):
         if not self.portfolio.has(asset):
             return
         qty       = self.portfolio.qty(asset)
         direction = self.trades.direction(asset)
-
-        # Clear locally FIRST — prevents repeated firing
         self.portfolio.close(asset, price, reason)
         self.trades.clear(asset)
-
-        # Then tell Alpaca
         side = OrderSide.SELL if direction == "LONG" else OrderSide.BUY
         self.alpaca._place(asset, qty, side)
 
-    # ── Main Loop ─────────────────────────────────────────────────────────────
-
     def run(self):
+        # ── Instant warmup from REST APIs ──────────────────────────────────
+        print("=" * 60)
+        print("  INSTANT WARMUP — fetching historical candles")
+        print("=" * 60)
+
+        crypto_warmed = warmup_crypto(self.engine)
+        stock_warmed  = warmup_stocks(self.engine)
+
+        print(f"\n  Warmed up: {crypto_warmed} crypto + {stock_warmed} stock assets")
+
+        # Check which assets are ready
+        ready_assets = [a for a in ALL_ASSETS if self.engine.ready(a)]
+        not_ready    = [a for a in ALL_ASSETS if not self.engine.ready(a)]
+        print(f"  Ready to trade: {ready_assets}")
+        if not_ready:
+            print(f"  Still warming:  {not_ready} (will warm from live data)")
+        print()
+
+        # ── Start live trading ─────────────────────────────────────────────
         self.consumer.subscribe(TOPICS, on_assign=self._on_assign)
-        print(
-            "Final Momentum Trader | 3-min Candles | "
-            "ADX-Filtered Donchian | VWAP Stocks | Long+Short\n"
-        )
-        print(f"Warming up — {CANDLES_NEEDED} × {CANDLE_MINUTES}min candles = "
-              f"~{CANDLES_NEEDED * CANDLE_MINUTES} minutes per asset\n")
+        print("Final Momentum Trader | Live | ADX-Filtered Donchian | Long+Short\n")
 
         try:
             while True:
@@ -638,82 +595,67 @@ class FinalMomentumTrader:
                 if not asset or not price or asset not in ALL_ASSETS:
                     continue
 
-                # Skip stocks outside market hours
                 if asset in STOCK_ASSETS and not is_us_market_hours():
                     self.consumer.commit(asynchronous=False)
                     continue
 
-                # ── 1. Real-time stop/target on every tick ─────────────────
+                # ── Stop/target on every tick ──────────────────────────────
 
                 if self.trades.has(asset):
                     self.trades.update_breakeven(asset, price)
                     outcome = self.trades.check_tick(asset, price)
-
                     if outcome == "TARGET":
                         print(f"\n  [TARGET ✓] {asset} | ${price:,.4f}")
                         self._close(asset, price, "TARGET_HIT")
                         self.consumer.commit(asynchronous=False)
                         continue
-
                     elif outcome == "STOP":
                         print(f"\n  [STOP ✗] {asset} | ${price:,.4f}")
                         self._close(asset, price, "STOP_LOSS")
                         self.consumer.commit(asynchronous=False)
                         continue
 
-                # ── 2. Build candle ────────────────────────────────────────
+                # ── Build candle ───────────────────────────────────────────
 
                 completed = self.candles.update(asset, price, volume)
                 if completed is None:
                     self.consumer.commit(asynchronous=False)
                     continue
 
-                # ── 3. Candle completed ────────────────────────────────────
-
                 self.engine.add_candle(asset, completed)
                 vwap_val = self.vwap.update(asset, completed)
                 self.portfolio.tick_cooldowns()
 
-                n = self.engine.collected(asset)
-
                 if not self.engine.ready(asset):
-                    print(
-                        f"  Candle {n:>2}/{CANDLES_NEEDED} | {asset:<5} | "
-                        f"O=${completed['open']:,.3f} "
-                        f"H=${completed['high']:,.3f} "
-                        f"L=${completed['low']:,.3f} "
-                        f"C=${completed['close']:,.3f}"
-                    )
+                    n = self.engine.collected(asset)
+                    print(f"  Warming {asset:<5} {n}/{CANDLES_NEEDED}")
                     self.consumer.commit(asynchronous=False)
                     continue
 
-                # ── 4. ADX exit check on candle close ──────────────────────
+                # ── ADX exit check ─────────────────────────────────────────
 
                 if self.trades.has(asset):
                     adx_now = self.engine.adx_value(asset)
                     if self.trades.check_adx_exit(asset, adx_now):
-                        print(
-                            f"\n  [ADX EXIT] {asset} | ADX={adx_now:.1f} < {ADX_EXIT_LEVEL} "
-                            f"(trend dying) | locking in profit"
-                        )
+                        print(f"\n  [ADX EXIT] {asset} | ADX={adx_now:.1f} < {ADX_EXIT_LEVEL}")
                         self._close(asset, completed["close"], "ADX_EXIT")
                         self.consumer.commit(asynchronous=False)
                         continue
 
-                # ── 5. Compute signal ──────────────────────────────────────
+                # ── Signal ─────────────────────────────────────────────────
 
                 signal, idict = self.engine.analyse(
                     asset, completed["close"],
                     vwap=vwap_val if asset in STOCK_ASSETS else None
                 )
 
-                adx_v   = idict.get("adx") or 0
-                vol_r   = idict.get("vol_ratio") or 0
-                atr_v   = idict.get("atr") or 0
-                t_ok    = "✓" if idict.get("trend_ok")  else "✗"
-                b_ok    = "✓" if idict.get("breakout")  else "✗"
-                v_ok    = "✓" if idict.get("vol_ok")    else "✗"
-                e_ok    = "✓" if idict.get("ema_ok")    else "✗"
+                adx_v = idict.get("adx") or 0
+                vol_r = idict.get("vol_ratio") or 0
+                atr_v = idict.get("atr") or 0
+                t_ok  = "✓" if idict.get("trend_ok") else "✗"
+                b_ok  = "✓" if idict.get("breakout") else "✗"
+                v_ok  = "✓" if idict.get("vol_ok")   else "✗"
+                e_ok  = "✓" if idict.get("ema_ok")   else "✗"
 
                 pos_info = ""
                 if self.trades.has(asset):
@@ -730,22 +672,14 @@ class FinalMomentumTrader:
                     f"{pos_info}"
                 )
 
-                # ── 6. Execute signal ──────────────────────────────────────
-
                 if signal == "BUY" and not self.portfolio.has(asset):
-                    print(
-                        f"\n  *** LONG BREAKOUT *** {asset} | "
-                        f"${completed['close']:,.3f} | ADX={adx_v:.1f} | "
-                        f"vol={vol_r:.1f}x"
-                    )
+                    print(f"\n  *** LONG BREAKOUT *** {asset} | "
+                          f"${completed['close']:,.3f} | ADX={adx_v:.1f} | vol={vol_r:.1f}x")
                     self._open(asset, completed["close"], atr_v, "LONG")
 
                 elif signal == "SHORT" and not self.portfolio.has(asset):
-                    print(
-                        f"\n  *** SHORT BREAKDOWN *** {asset} | "
-                        f"${completed['close']:,.3f} | ADX={adx_v:.1f} | "
-                        f"vol={vol_r:.1f}x"
-                    )
+                    print(f"\n  *** SHORT BREAKDOWN *** {asset} | "
+                          f"${completed['close']:,.3f} | ADX={adx_v:.1f} | vol={vol_r:.1f}x")
                     self._open(asset, completed["close"], atr_v, "SHORT")
 
                 self.consumer.commit(asynchronous=False)

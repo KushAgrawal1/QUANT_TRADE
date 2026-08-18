@@ -1,26 +1,13 @@
 """
-indicators.py — Complete Technical Indicator Library
+indicators.py — Fixed ADX implementation.
 
-Indicators used by the final momentum system:
-  - EMA:               trend direction
-  - RSI (Wilder):      momentum context
-  - ATR (Wilder):      volatility / stop placement
-  - Donchian Channel:  breakout level detection
-  - Volume Ratio:      institutional confirmation
-  - ADX (Wilder):      trend STRENGTH — the key filter
-  - VWAP:              institutional flow alignment (stocks)
-
-Research basis:
-  Donchian (1950s), Wilder (1978), Faith (2007 Turtle Traders),
-  Fazen Capital backtests (2026): ADX>25 filter +25% win rate improvement
-  PyQuantLab (2025): ADX range filter 36% → 182% profit improvement
-  AlgoTrading Research (2026): ADX exits improved RET/DD from 3.42 → 6.12
+Bug fixed: _wilder_smooth was accumulating raw sums instead of averages,
+causing ADX values to explode to 100-800+.
+Correct Wilder's formula seeds with sum/period (average), not raw sum.
 """
 
 import math
 
-
-# ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _ema_series(prices: list, period: int) -> list:
     k = 2 / (period + 1)
@@ -31,16 +18,20 @@ def _ema_series(prices: list, period: int) -> list:
 
 
 def _wilder_smooth(data: list, period: int) -> list:
-    """Wilder's smoothing — the correct method for ATR, ADX, RSI."""
+    """
+    Correct Wilder's smoothing.
+    Seeds with AVERAGE of first N values (not raw sum).
+    Then: next = (prev * (N-1) + current) / N
+    This keeps values bounded — without the /period, values explode.
+    """
     if len(data) < period:
         return []
-    result = [sum(data[:period])]
+    # Seed: average of first N values
+    result = [sum(data[:period]) / period]
     for val in data[period:]:
-        result.append(result[-1] - result[-1] / period + val)
+        result.append((result[-1] * (period - 1) + val) / period)
     return result
 
-
-# ── Indicators ────────────────────────────────────────────────────────────────
 
 def ema(prices: list, period: int) -> float | None:
     if len(prices) < period:
@@ -49,7 +40,6 @@ def ema(prices: list, period: int) -> float | None:
 
 
 def rsi(prices: list, period: int = 14) -> float | None:
-    """RSI using Wilder's smoothing."""
     if len(prices) < period + 1:
         return None
     changes = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
@@ -66,7 +56,6 @@ def rsi(prices: list, period: int = 14) -> float | None:
 
 
 def atr(highs: list, lows: list, closes: list, period: int = 14) -> float | None:
-    """True ATR using Wilder's smoothing on OHLC candle data."""
     if len(closes) < period + 1:
         return None
     trs = [max(
@@ -79,26 +68,12 @@ def atr(highs: list, lows: list, closes: list, period: int = 14) -> float | None
 
 
 def donchian_channel(highs: list, lows: list, period: int = 15) -> tuple:
-    """
-    Donchian Channel — N-period highest high and lowest low.
-
-    BUY signal : price > channel_high (broke above resistance)
-    SHORT signal: price < channel_low  (broke below support)
-
-    Note: always pass highs/lows EXCLUDING the current candle
-    (so you're comparing price to the PRIOR N candles, not the current one).
-    """
     if len(highs) < period or len(lows) < period:
         return None, None
     return round(max(highs[-period:]), 6), round(min(lows[-period:]), 6)
 
 
 def volume_ratio(volumes: list, period: int = 15) -> float | None:
-    """
-    Current volume vs N-period average.
-    > 1.5 = volume spike = institutional participation confirmed.
-    > 2.0 = strong spike = high-conviction breakout.
-    """
     if len(volumes) < period + 1:
         return None
     avg = sum(volumes[-(period + 1):-1]) / period
@@ -109,23 +84,15 @@ def volume_ratio(volumes: list, period: int = 15) -> float | None:
 
 def adx(highs: list, lows: list, closes: list, period: int = 14) -> tuple:
     """
-    Average Directional Index (Wilder, 1978).
+    Average Directional Index — FIXED implementation.
 
-    Returns: (adx_value, is_rising)
+    ADX range: 0-100
+      > 25 AND rising = strong trend → take breakouts
+      < 20            = ranging      → skip all signals
 
-    Interpretation:
-      ADX > 25 AND rising  → strong trend forming/continuing → take breakouts
-      ADX 20-25            → weak trend → be cautious
-      ADX < 20             → ranging/choppy → skip all signals (Donchian fails here)
-      ADX falling          → trend losing strength → consider early exit
-
-    Why this is the most important filter:
-      Donchian Channel fires in ALL markets — trending AND ranging.
-      In ranging markets, 70%+ of breakouts fail immediately.
-      ADX tells you which type of market you're in BEFORE you enter.
-
-    Research: Fazen Capital (2026) — ADX>25 filter improved win rate by 25%.
-              PyQuantLab (2025)   — ADX filter improved profit 36% → 182%.
+    The fix: _wilder_smooth now seeds with average (sum/n), not raw sum.
+    Old code: result = [sum(data[:n])]       ← wrong, explodes to 100-800
+    New code: result = [sum(data[:n]) / n]   ← correct, stays 0-100
     """
     min_len = period * 2 + 1
     if len(closes) < min_len:
@@ -135,7 +102,6 @@ def adx(highs: list, lows: list, closes: list, period: int = 14) -> tuple:
     for i in range(1, len(closes)):
         high_move = highs[i] - highs[i - 1]
         low_move  = lows[i - 1] - lows[i]
-
         tr = max(
             highs[i] - lows[i],
             abs(highs[i] - closes[i - 1]),
