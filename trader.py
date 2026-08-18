@@ -489,11 +489,15 @@ class AlpacaExecutor:
 
     def _place(self, asset: str, qty: float, side: OrderSide) -> bool:
         try:
+            # Stocks: DAY order (required for fractional shares)
+            # Crypto: GTC (markets never close)
+            tif = TimeInForce.DAY if asset in STOCK_ASSETS else TimeInForce.GTC
+
             order = MarketOrderRequest(
                 symbol=to_alpaca_symbol(asset),
                 qty=floor_qty(qty),
                 side=side,
-                time_in_force=TimeInForce.GTC,
+                time_in_force=tif,
             )
             r = self.client.submit_order(order)
             print(f"  [ALPACA] {side.value.upper():<5} | id={str(r.id)[:8]}...")
@@ -501,7 +505,6 @@ class AlpacaExecutor:
         except Exception as e:
             print(f"  [ALPACA ERROR] {side.value} {asset}: {e}")
             return False
-
     def buy(self, asset: str, qty: float) -> bool:
         return self._place(asset, qty, OrderSide.BUY)
 
