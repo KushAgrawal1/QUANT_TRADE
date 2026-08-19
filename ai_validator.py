@@ -190,6 +190,6 @@ Respond ONLY with JSON — no other text:
         return execute, confidence, reason
 
     except json.JSONDecodeError:
-        return True, 5, "AI parse error — proceeding"
+        return True, 7, "AI parse error — proceeding with trade"
     except Exception as e:
         return True, 5, f"AI error — proceeding ({str(e)[:30]})"

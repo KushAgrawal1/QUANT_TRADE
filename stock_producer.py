@@ -16,9 +16,11 @@ NOTE: Only produces data during US market hours
 
 import os
 import json
+import time
 from dotenv import load_dotenv
 from confluent_kafka import Producer
 from alpaca.data.live import StockDataStream
+
 
 load_dotenv()
 
@@ -84,4 +86,9 @@ stream.subscribe_trades(handle_trade, *STOCKS)
 print(f"Starting stock stream: {', '.join(STOCKS)}")
 print("Note: Active only during US market hours (Mon-Fri 9:30 AM - 4:00 PM ET)\n")
 
-stream.run()
+while True:
+    try:
+        stream.run()
+    except Exception as e:
+        print(f"Stream error: {e} — reconnecting in 10s")
+        time.sleep(10)

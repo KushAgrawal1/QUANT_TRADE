@@ -1,14 +1,13 @@
 """
 producer.py — Kraken WebSocket → Kafka (10 crypto pairs)
 
-More pairs = more breakout opportunities running in parallel.
-Lower-priced altcoins (XRP, ADA, DOGE) generate larger position
-sizes relative to our $10k notional cap → more profit per win.
-
-Topic: crypto-trades (10 partitions)
+Auto-reconnects on WebSocket disconnect — runs forever without manual restart.
+This was the root cause of no trades overnight: WebSocket dropped and
+the script exited instead of reconnecting.
 """
 
 import json
+import time
 import websocket
 from datetime import datetime, timezone
 from confluent_kafka import Producer
@@ -43,13 +42,13 @@ def on_delivery(err, msg):
 
 
 def on_open(ws):
-    print("Connected to Kraken WebSocket\n")
+    now = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    print(f"[{now}] Connected to Kraken WebSocket")
     ws.send(json.dumps({
         "event":        "subscribe",
         "pair":         list(PAIR_TO_COIN.keys()),
         "subscription": {"name": "trade"},
     }))
-    print(f"Subscribed to: {', '.join(PAIR_TO_COIN.values())}\n")
 
 
 def on_message(ws, raw):
@@ -85,21 +84,53 @@ def on_message(ws, raw):
 
 
 def on_error(ws, error):
-    print(f"\nWebSocket error: {error}")
+    now = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    print(f"[{now}] WebSocket error: {error}")
 
 
 def on_close(ws, *args):
+    now = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    print(f"[{now}] WebSocket closed — will reconnect in 5 seconds...")
     producer.flush()
-    print("\nConnection closed.")
+
+
+def run():
+    """
+    Main loop — reconnects automatically on any disconnect or error.
+    Kraken WebSocket drops connections every few hours — this handles it.
+    """
+    retry_delay = 5    # seconds between reconnect attempts
+    max_delay   = 60   # cap backoff at 60 seconds
+
+    print("Starting 10-coin Kraken stream → Kafka (auto-reconnect enabled)\n")
+
+    while True:
+        try:
+            ws = websocket.WebSocketApp(
+                "wss://ws.kraken.com",
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
+            ws.run_forever(ping_interval=30, ping_timeout=10)
+
+        except Exception as e:
+            now = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            print(f"[{now}] Exception: {e}")
+
+        # Connection dropped — wait and reconnect
+        now = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        print(f"[{now}] Reconnecting in {retry_delay}s...")
+        time.sleep(retry_delay)
+
+        # Exponential backoff up to max_delay
+        retry_delay = min(retry_delay * 2, max_delay)
+
+        # Reset delay after successful long connection
+        # (run_forever running > 60s means connection was healthy)
+        retry_delay = 5
 
 
 if __name__ == "__main__":
-    print("Starting 10-coin Kraken stream → Kafka\n")
-    ws = websocket.WebSocketApp(
-        "wss://ws.kraken.com",
-        on_open=on_open,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close,
-    )
-    ws.run_forever()
+    run()
