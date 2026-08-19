@@ -1,36 +1,12 @@
 """
 trader.py — Overnight AI-Enhanced Momentum Trader
 
-NEW in this version:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-1. CLAUDE AI SIGNAL VALIDATOR
-   Before every trade executes, Claude validates the signal.
-   Research: binary AI confirmation reduces false signals 40-70%.
-   Only trades when Claude says YES with confidence >= 7/10.
-   If no API key: skips validation, trades normally.
-
-2. CRYPTO FEAR & GREED INDEX
-   Fetches real-time market sentiment every 30 minutes.
-   Extreme Fear (<25): skip crypto BUYs (institutions selling)
-   Extreme Greed (>75): skip crypto BUYs (market overextended)
-   Free API, no auth needed.
-
-3. OVERNIGHT SAFETY FEATURES
-   - 3 consecutive losses → 45-minute trading pause
-   - Capital < 97k ($3k down) → reduce position size by 50%
-   - Capital < 95k ($5k down) → full halt, protect remaining
-   - All activity logged to trading_log_YYYYMMDD_HHMM.txt
-
-4. TRADE LOG FILE
-   Every signal, trade, and P&L written to disk automatically.
-   Review in the morning to see exactly what happened.
-
-HOW TO ENABLE CLAUDE VALIDATION:
-  1. console.anthropic.com → API Keys → Create
-  2. Add to .env: ANTHROPIC_API_KEY=sk-ant-...
-  3. pip install anthropic
-  (Optional — system works without it, just less filtered)
+Fixes in this version:
+  1. ema(✓/✗) now visible in every scan line
+     — you can now see exactly why a trade was or wasn't blocked
+  2. EMA tolerance: e9 >= e21 * 0.995
+     — allows trade when EMA9 is within 0.5% of EMA21
+     — prevents missed trades after big overnight price moves
 """
 
 import os
@@ -84,14 +60,12 @@ MAX_POSITIONS    = 3
 INITIAL_CAPITAL  = 100_000.0
 CANDLE_COOLDOWN  = 3
 
-# Overnight safety
 CONSECUTIVE_LOSS_LIMIT = 3
 PAUSE_MINUTES          = 45
-SLOW_MODE_CAPITAL      = 97_000.0   # below this → half position size
-HALT_CAPITAL           = 95_000.0   # below this → full halt
+SLOW_MODE_CAPITAL      = 97_000.0
+HALT_CAPITAL           = 95_000.0
 
-# Claude AI
-AI_CONFIDENCE_THRESHOLD = 7   # out of 10
+AI_CONFIDENCE_THRESHOLD = 7
 
 KRAKEN_REST_PAIRS = {
     "BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD",
@@ -119,11 +93,6 @@ def floor_qty(qty: float) -> float:
 # ── Overnight Logger ──────────────────────────────────────────────────────────
 
 class OvernightLogger:
-    """
-    Writes every signal, trade, and P&L to a timestamped log file.
-    Review in the morning to see exactly what happened overnight.
-    """
-
     def __init__(self):
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
         self.filename = f"trading_log_{ts}.txt"
@@ -140,27 +109,20 @@ class OvernightLogger:
     def log(self, msg: str):
         self._write(msg)
 
-    def log_signal(self, asset: str, signal: str, price: float,
-                   adx: float, vol: float, ai_conf: int, ai_reason: str):
+    def log_signal(self, asset, signal, price, adx, vol, ai_conf, ai_reason):
         self._write(
             f"SIGNAL {signal:<6} | {asset:<5} | ${price:,.4f} | "
-            f"ADX={adx:.1f} vol={vol:.1f}x | "
-            f"AI={ai_conf}/10 '{ai_reason}'"
+            f"ADX={adx:.1f} vol={vol:.1f}x | AI={ai_conf}/10 '{ai_reason}'"
         )
 
-    def log_trade(self, action: str, asset: str, qty: float,
-                  price: float, pnl: float = 0, reason: str = ""):
+    def log_trade(self, action, asset, qty, price, pnl=0, reason=""):
         if action == "OPEN":
             self._write(f"OPEN  | {asset:<5} | qty={qty} | ${price:,.4f}")
         else:
             tag = "PROFIT" if pnl >= 0 else "LOSS"
-            self._write(
-                f"CLOSE | {asset:<5} | ${price:,.4f} | "
-                f"{tag}: ${pnl:+.2f} | {reason}"
-            )
+            self._write(f"CLOSE | {asset:<5} | ${price:,.4f} | {tag}: ${pnl:+.2f} | {reason}")
 
-    def log_summary(self, capital: float, pnl: float, trades: int,
-                    wins: int, losses: int):
+    def log_summary(self, capital, pnl, trades, wins, losses):
         wr = (wins / trades * 100) if trades else 0
         self._write("─" * 60)
         self._write(f"SUMMARY | Capital=${capital:,.2f} | P&L=${pnl:+.2f} | "
@@ -240,9 +202,9 @@ class SignalEngine:
         return len(self.closes[asset])
 
     def recent_candles(self, asset: str) -> list:
-        closes  = list(self.closes[asset])[-5:]
-        highs   = list(self.highs[asset])[-5:]
-        lows    = list(self.lows[asset])[-5:]
+        closes = list(self.closes[asset])[-5:]
+        highs  = list(self.highs[asset])[-5:]
+        lows   = list(self.lows[asset])[-5:]
         return [{"open": closes[i], "high": highs[i],
                  "low": lows[i], "close": closes[i]}
                 for i in range(len(closes))]
@@ -264,13 +226,17 @@ class SignalEngine:
         breakout_up = bool(don_high and price > don_high)
         breakout_dn = bool(don_low  and price < don_low)
         vol_ok      = bool(vol_r and vol_r >= VOLUME_THRESHOLD)
-        ema_up      = bool(e9 and e21 and e9 > e21)
-        ema_dn      = bool(e9 and e21 and e9 < e21)
 
-        above_vwap      = bool(vwap and price > vwap)
-        below_vwap      = bool(vwap and price < vwap)
-        vwap_buy        = (above_vwap if asset in STOCK_ASSETS else True)
-        vwap_sell       = (below_vwap if asset in STOCK_ASSETS else True)
+        # FIX: allow EMA9 within 0.5% of EMA21
+        # Prevents missed trades after big overnight price moves
+        # when EMAs are still catching up to new price levels
+        ema_up = bool(e9 and e21 and e9 >= e21 * 0.995)
+        ema_dn = bool(e9 and e21 and e9 < e21)
+
+        above_vwap = bool(vwap and price > vwap)
+        below_vwap = bool(vwap and price < vwap)
+        vwap_buy   = (above_vwap if asset in STOCK_ASSETS else True)
+        vwap_sell  = (below_vwap if asset in STOCK_ASSETS else True)
 
         if trend_ok and breakout_up and vol_ok and ema_up and vwap_buy:
             signal = "BUY"
@@ -284,8 +250,10 @@ class SignalEngine:
             "adx": adx_val, "adx_up": adx_rising,
             "don_high": don_high, "don_low": don_low,
             "vol_ratio": vol_r, "atr": atr_val,
-            "trend_ok": trend_ok, "breakout": breakout_up or breakout_dn,
-            "vol_ok": vol_ok, "ema_ok": ema_up or ema_dn,
+            "trend_ok": trend_ok,
+            "breakout": breakout_up or breakout_dn,
+            "vol_ok":   vol_ok,
+            "ema_ok":   ema_up or ema_dn,
         }
 
     def adx_value(self, asset: str) -> float | None:
@@ -384,7 +352,6 @@ class Portfolio:
             self.cooldowns[a] += 1
 
     def is_paused(self) -> bool:
-        """3 consecutive losses → 45-min pause to prevent emotional spiralling."""
         if self.pause_until is None:
             return False
         if datetime.now(timezone.utc) >= self.pause_until:
@@ -394,15 +361,9 @@ class Portfolio:
             print(f"\n  [RESUME] {msg}")
             self.logger.log(f"RESUME | {msg}")
             return False
-        remaining = (self.pause_until - datetime.now(timezone.utc)).seconds // 60
         return True
 
-    def is_halted(self) -> bool:
-        """Capital below $95k → full stop."""
-        return self.capital < HALT_CAPITAL
-
     def in_slow_mode(self) -> bool:
-        """Capital $95k-$97k → half position size."""
         return HALT_CAPITAL <= self.capital < SLOW_MODE_CAPITAL
 
     def can_open(self, asset: str) -> tuple[bool, str]:
@@ -422,7 +383,7 @@ class Portfolio:
         atr_safe = max(atr, price * 0.001)
         risk     = self.capital * RISK_PER_TRADE
         if self.in_slow_mode():
-            risk *= 0.5    # half size when down
+            risk *= 0.5
         stop_d = STOP_ATR_MULT * atr_safe
         qty    = risk / stop_d if stop_d > 0 else 0
         qty    = min(qty, MAX_NOTIONAL / price)
@@ -448,7 +409,7 @@ class Portfolio:
 
         if pnl >= 0:
             self.wins             += 1
-            self.consecutive_loss  = 0    # reset on win
+            self.consecutive_loss  = 0
         else:
             self.losses           += 1
             self.consecutive_loss += 1
@@ -477,8 +438,8 @@ class Portfolio:
         return self.capital < HALT_CAPITAL
 
     def dashboard(self):
-        wr = (self.wins / self.trade_count * 100) if self.trade_count else 0
-        dd = max(0, (INITIAL_CAPITAL - self.capital) / INITIAL_CAPITAL * 100)
+        wr   = (self.wins / self.trade_count * 100) if self.trade_count else 0
+        dd   = max(0, (INITIAL_CAPITAL - self.capital) / INITIAL_CAPITAL * 100)
         mode = " [SLOW MODE]" if self.in_slow_mode() else ""
         print("\n" + "═" * 68)
         print(f"  OVERNIGHT TRADER DASHBOARD{mode}")
@@ -544,11 +505,11 @@ def warmup_crypto(engine) -> int:
             if data.get("error") and data["error"]:
                 print(f"  ✗ {coin}: {data['error']}")
                 continue
-            result_key  = [k for k in data["result"].keys() if k != "last"][0]
-            raw         = data["result"][result_key]
-            usable      = raw[:-1]
-            three_min   = []
-            i, group    = len(usable) - 1, []
+            result_key = [k for k in data["result"].keys() if k != "last"][0]
+            raw        = data["result"][result_key]
+            usable     = raw[:-1]
+            three_min  = []
+            i, group   = len(usable) - 1, []
             while i >= 0 and len(three_min) < WARMUP_CANDLES:
                 group.insert(0, usable[i])
                 if len(group) == 3:
@@ -563,8 +524,7 @@ def warmup_crypto(engine) -> int:
                 i -= 1
             for c in three_min:
                 engine.add_candle(coin, c)
-            print(f"  ✓ {coin:<5} {len(three_min)} candles | "
-                  f"${three_min[-1]['close']:,.4f}")
+            print(f"  ✓ {coin:<5} {len(three_min)} candles | ${three_min[-1]['close']:,.4f}")
             warmed += 1
         except Exception as e:
             print(f"  ✗ {coin}: {e}")
@@ -616,7 +576,6 @@ class OvernightTrader:
         self.portfolio = Portfolio(self.logger)
         self.alpaca    = AlpacaExecutor()
 
-        # Check AI availability
         fg_val, fg_label = ai.get_fear_greed()
         ai_key = os.getenv("ANTHROPIC_API_KEY")
         print(f"  Fear & Greed    : {fg_val}/100 ({fg_label})")
@@ -627,8 +586,6 @@ class OvernightTrader:
     def _on_assign(self, consumer, partitions):
         print(f"  Partitions: {[p.partition for p in partitions]}\n")
 
-    # ── Open with AI validation ───────────────────────────────────────────────
-
     def _open(self, asset: str, price: float, atr: float,
               direction: str, signal_idict: dict):
         can, reason = self.portfolio.can_open(asset)
@@ -637,27 +594,21 @@ class OvernightTrader:
             return
         if not atr or atr <= 0:
             return
-
-        # Minimum ATR filter — avoid micro-move coins
         if STOP_ATR_MULT * atr < 0.50:
             print(f"  [SKIP] {asset} — ATR too small (${atr:.4f})")
             return
 
         is_crypto = asset in CRYPTO_ASSETS
 
-        # ── Fear & Greed filter ────────────────────────────────────────────
         fg_ok, fg_reason = ai.fear_greed_filter(direction, is_crypto)
         if not fg_ok:
-            print(f"  [FEAR&GREED SKIP] {asset} — {fg_reason}")
+            print(f"  [F&G SKIP] {asset} — {fg_reason}")
             self.logger.log(f"SKIP {direction} {asset} | F&G: {fg_reason}")
             return
 
-        # ── Claude AI validation ───────────────────────────────────────────
         fg_val, _ = ai.get_fear_greed()
         execute, confidence, ai_reason = ai.validate_with_claude(
-            asset=asset,
-            signal=direction,
-            price=price,
+            asset=asset, signal=direction, price=price,
             adx=signal_idict.get("adx") or 0,
             vol_ratio=signal_idict.get("vol_ratio") or 0,
             atr=atr,
@@ -665,12 +616,10 @@ class OvernightTrader:
             fear_greed_val=fg_val,
         )
 
-        self.logger.log_signal(
-            asset, direction, price,
-            signal_idict.get("adx") or 0,
-            signal_idict.get("vol_ratio") or 0,
-            confidence, ai_reason,
-        )
+        self.logger.log_signal(asset, direction, price,
+                               signal_idict.get("adx") or 0,
+                               signal_idict.get("vol_ratio") or 0,
+                               confidence, ai_reason)
 
         if not execute or confidence < AI_CONFIDENCE_THRESHOLD:
             print(f"  [AI SKIP] {asset} {direction} | "
@@ -708,8 +657,6 @@ class OvernightTrader:
                 print(f"\n  [MARKET CLOSE] Closing {asset}")
                 self._close(asset, price, "MARKET_CLOSE")
 
-    # ── Main Loop ─────────────────────────────────────────────────────────────
-
     def run(self):
         print("=" * 60)
         print("  INSTANT WARMUP")
@@ -726,7 +673,6 @@ class OvernightTrader:
 
         try:
             while True:
-                # ── Halt check ─────────────────────────────────────────────
                 if self.portfolio.max_drawdown_hit():
                     msg = f"Capital ${self.portfolio.capital:,.2f} < ${HALT_CAPITAL:,.2f} — HALTED"
                     print(f"\n  [HALT] {msg}")
@@ -754,7 +700,6 @@ class OvernightTrader:
                     self.consumer.commit(asynchronous=False)
                     continue
 
-                # ── Real-time stop/target ───────────────────────────────────
                 if self.trades.has(asset):
                     self.trades.update_breakeven(asset, price)
                     outcome = self.trades.check_tick(asset, price)
@@ -769,7 +714,6 @@ class OvernightTrader:
                         self.consumer.commit(asynchronous=False)
                         continue
 
-                # ── Build candle ────────────────────────────────────────────
                 completed = self.candles.update(asset, price, volume)
                 if completed is None:
                     self.consumer.commit(asynchronous=False)
@@ -786,7 +730,6 @@ class OvernightTrader:
                     self.consumer.commit(asynchronous=False)
                     continue
 
-                # ── ADX exit ────────────────────────────────────────────────
                 if self.trades.has(asset):
                     adx_now = self.engine.adx_value(asset)
                     if self.trades.check_adx_exit(asset, adx_now):
@@ -795,7 +738,6 @@ class OvernightTrader:
                         self.consumer.commit(asynchronous=False)
                         continue
 
-                # ── Signal ──────────────────────────────────────────────────
                 signal, idict = self.engine.analyse(
                     asset, completed["close"],
                     vwap=vwap_val if asset in STOCK_ASSETS else None
@@ -807,6 +749,7 @@ class OvernightTrader:
                 t_ok  = "✓" if idict.get("trend_ok") else "✗"
                 b_ok  = "✓" if idict.get("breakout") else "✗"
                 v_ok  = "✓" if idict.get("vol_ok")   else "✗"
+                e_ok  = "✓" if idict.get("ema_ok")   else "✗"  # ← NEW
 
                 pos_info = ""
                 if self.trades.has(asset):
@@ -818,6 +761,7 @@ class OvernightTrader:
                     f"ADX={adx_v:>5.1f}({t_ok}) "
                     f"broke({b_ok}) "
                     f"vol×{vol_r:.1f}({v_ok}) "
+                    f"ema({e_ok}) "          # ← NEW: now visible
                     f"ATR=${atr_v:,.2f}"
                     f"{pos_info}"
                 )
