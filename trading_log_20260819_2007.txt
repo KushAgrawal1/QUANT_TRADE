@@ -4,3 +4,53 @@
 [20:07:59] Trader started — overnight mode active
 [20:27:14] SIGNAL LONG   | ETH   | $2,121.3500 | ADX=55.9 vol=4.9x | AI=7/10 'AI parse error — proceeding with trade'
 [20:27:14] OPEN  | ETH   | qty=4.7139 | $2,121.3500
+[20:37:40] CLOSE | ETH   | $2,121.3200 | LOSS: $-0.14 | STOP_LOSS
+[20:51:01] SIGNAL LONG   | ETH   | $2,179.6000 | ADX=60.9 vol=17.7x | AI=7/10 'AI parse error — proceeding with trade'
+[20:51:02] OPEN  | ETH   | qty=4.5879 | $2,179.6000
+[20:51:03] SIGNAL LONG   | BTC   | $69,141.5000 | ADX=30.6 vol=4.7x | AI=7/10 'AI parse error — proceeding with trade'
+[20:51:03] OPEN  | BTC   | qty=0.1446 | $69,141.5000
+[20:51:04] CLOSE | ETH   | $2,205.8600 | PROFIT: $+120.48 | TARGET_HIT
+[20:51:11] CLOSE | BTC   | $69,460.3000 | PROFIT: $+46.10 | TARGET_HIT
+[21:06:01] SIGNAL LONG   | ETH   | $2,256.4700 | ADX=70.9 vol=1.6x | AI=7/10 'AI parse error — proceeding with trade'
+[21:06:01] OPEN  | ETH   | qty=4.4317 | $2,256.4700
+[21:07:18] CLOSE | ETH   | $2,304.7300 | PROFIT: $+213.87 | TARGET_HIT
+[21:09:01] SIGNAL LONG   | SOL   | $86.1900 | ADX=62.5 vol=2.9x | AI=7/10 'AI parse error — proceeding with trade'
+[21:09:01] OPEN  | SOL   | qty=116.0227 | $86.1900
+[22:01:57] CLOSE | SOL   | $86.1900 | PROFIT: $+0.00 | STOP_LOSS
+[22:01:57] ────────────────────────────────────────────────────────────
+[22:01:57] SUMMARY | Capital=$100,380.31 | P&L=$+380.31 | Trades=5 (4W/1L) Win=80.0%
+[22:01:57] ────────────────────────────────────────────────────────────
+[05:27:06] SIGNAL LONG   | BTC   | $69,604.5000 | ADX=34.1 vol=4.0x | AI=7/10 'AI parse error — proceeding with trade'
+[05:27:07] OPEN  | BTC   | qty=0.1436 | $69,604.5000
+[05:38:37] CLOSE | BTC   | $69,512.0000 | LOSS: $-13.28 | STOP_LOSS
+[08:09:02] SIGNAL LONG   | BTC   | $70,175.5000 | ADX=25.3 vol=27.9x | AI=7/10 'AI parse error — proceeding with trade'
+[08:09:02] OPEN  | BTC   | qty=0.1424 | $70,175.5000
+[08:09:19] CLOSE | BTC   | $70,478.9000 | PROFIT: $+43.20 | TARGET_HIT
+[08:15:01] SIGNAL LONG   | BTC   | $71,268.1000 | ADX=33.1 vol=5.0x | AI=7/10 'AI parse error — proceeding with trade'
+[08:15:01] OPEN  | BTC   | qty=0.1403 | $71,268.1000
+[08:16:10] CLOSE | BTC   | $70,996.7000 | LOSS: $-38.08 | STOP_LOSS
+[08:18:03] SIGNAL LONG   | BTC   | $71,522.7000 | ADX=36.8 vol=3.2x | AI=7/10 'AI parse error — proceeding with trade'
+[08:18:04] OPEN  | BTC   | qty=0.1398 | $71,522.7000
+[08:20:33] CLOSE | BTC   | $71,212.5000 | LOSS: $-43.37 | STOP_LOSS
+[10:15:01] SIGNAL LONG   | BTC   | $72,077.8000 | ADX=39.8 vol=6.2x | AI=7/10 'AI parse error — proceeding with trade'
+[10:15:02] OPEN  | BTC   | qty=0.1387 | $72,077.8000
+[10:25:46] PAUSE | 3 consecutive losses — pausing 45min until 11:10 UTC
+[10:25:46] CLOSE | BTC   | $72,077.0000 | LOSS: $-0.11 | STOP_LOSS
+[10:25:46] ────────────────────────────────────────────────────────────
+[10:25:46] SUMMARY | Capital=$100,328.68 | P&L=$+328.68 | Trades=10 (5W/5L) Win=50.0%
+[10:25:46] ────────────────────────────────────────────────────────────
+[11:27:00] RESUME | Pause ended — resuming trading
+[11:36:03] SIGNAL LONG   | BTC   | $72,125.1000 | ADX=26.8 vol=5.3x | AI=7/10 'AI parse error — proceeding with trade'
+[11:36:03] OPEN  | BTC   | qty=0.1386 | $72,125.1000
+[11:55:14] CLOSE | BTC   | $71,938.4000 | LOSS: $-25.88 | STOP_LOSS
+[15:21:04] SIGNAL LONG   | ETH   | $2,307.1600 | ADX=27.4 vol=3.6x | AI=7/10 'AI parse error — proceeding with trade'
+[15:21:05] OPEN  | ETH   | qty=4.3343 | $2,307.1600
+[15:23:48] CLOSE | ETH   | $2,296.3600 | LOSS: $-46.81 | STOP_LOSS
+[15:33:01] SIGNAL LONG   | BTC   | $72,608.7000 | ADX=28.2 vol=1.9x | AI=7/10 'AI parse error — proceeding with trade'
+[15:33:02] OPEN  | BTC   | qty=0.1377 | $72,608.7000
+[15:33:04] SIGNAL LONG   | ETH   | $2,313.5600 | ADX=37.0 vol=6.1x | AI=7/10 'AI parse error — proceeding with trade'
+[15:33:04] OPEN  | ETH   | qty=4.3223 | $2,313.5600
+[15:35:24] Trader stopped by user
+[15:35:24] ────────────────────────────────────────────────────────────
+[15:35:24] SUMMARY | Capital=$100,255.99 | P&L=$+255.99 | Trades=12 (5W/7L) Win=41.7%
+[15:35:24] ────────────────────────────────────────────────────────────

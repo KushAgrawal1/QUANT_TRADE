@@ -1,13 +1,13 @@
 """
 ai_validator.py — AI-Powered Signal Validation Layer
 
-Fix: JSON parse error now defaults to confidence=7 (proceeds with trade)
-     instead of confidence=5 (blocked trade). This was causing valid
-     signals like ETH to be skipped when Claude returned slightly
-     malformed JSON.
+Fix: Claude was returning JSON wrapped in markdown or with preamble text.
+     Simple json.loads() failed every time → parse error fallback fired.
+     Now uses regex to extract the JSON object from anywhere in the response.
 """
 
 import os
+import re
 import json
 import requests
 from datetime import datetime, timezone
@@ -79,6 +79,31 @@ def fear_greed_filter(signal: str, is_crypto: bool) -> tuple[bool, str]:
 
 # ── Claude Signal Validator ───────────────────────────────────────────────────
 
+def _extract_json(text: str) -> dict:
+    """
+    Robustly extract JSON from Claude's response.
+
+    Claude sometimes wraps JSON in markdown:
+      ```json
+      {"execute": true, "confidence": 8, "reason": "..."}
+      ```
+    Or adds preamble text:
+      "Based on the analysis: {"execute": true, ...}"
+
+    This regex finds the first {...} block regardless of surrounding text.
+    """
+    # Remove markdown code fences first
+    text = re.sub(r'```(?:json)?', '', text).strip()
+
+    # Find the first complete JSON object
+    match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+    if match:
+        return json.loads(match.group())
+
+    # Last resort — try parsing the whole thing
+    return json.loads(text)
+
+
 def validate_with_claude(
     asset: str,
     signal: str,
@@ -128,17 +153,19 @@ Stop:   ${stop:.4f}
 Target: ${target:.4f}
 R:R = 2:1
 
-Is this a genuine breakout? Respond ONLY with JSON:
-{{"execute": true, "confidence": 8, "reason": "brief reason under 12 words"}}"""
+Is this a genuine breakout or likely a false signal?
+
+YOU MUST respond with ONLY a raw JSON object. No markdown, no explanation, no backticks.
+Example of correct response: {{"execute": true, "confidence": 8, "reason": "strong momentum confirmed"}}"""
 
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=80,
+            max_tokens=100,
             messages=[{"role": "user", "content": prompt}],
         )
 
         text   = response.content[0].text.strip()
-        result = json.loads(text)
+        result = _extract_json(text)
 
         execute    = bool(result.get("execute", True))
         confidence = int(result.get("confidence", 7))
@@ -146,10 +173,5 @@ Is this a genuine breakout? Respond ONLY with JSON:
 
         return execute, confidence, reason
 
-    except json.JSONDecodeError:
-        # FIX: was returning confidence=5 which BLOCKED trades on parse errors
-        # Now returns 7 so the trade proceeds when Claude response is malformed
-        return True, 7, "AI parse error — proceeding with trade"
-
-    except Exception as e:
+    except (json.JSONDecodeError, Exception) as e:
         return True, 7, f"AI error — proceeding ({str(e)[:30]})"

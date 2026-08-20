@@ -2,11 +2,17 @@
 trader.py — Overnight AI-Enhanced Momentum Trader
 
 Fixes in this version:
-  1. ema(✓/✗) now visible in every scan line
-     — you can now see exactly why a trade was or wasn't blocked
-  2. EMA tolerance: e9 >= e21 * 0.995
-     — allows trade when EMA9 is within 0.5% of EMA21
-     — prevents missed trades after big overnight price moves
+  1. Longer cooldown after TARGET hit (7 candles = 21 min)
+     — prevents re-entering same asset immediately after profit
+     — morning BTC losses were caused by 3 back-to-back entries
+       on the same choppy breakout
+
+  2. Loss cooldown protection (10 candles = 30 min)
+     — after a STOP_LOSS on an asset, wait 30 min before re-entering
+     — prevents chasing a reversing market
+
+  3. Last trade result tracked per asset
+     — used for intelligent cooldown decisions
 """
 
 import os
@@ -58,7 +64,11 @@ RISK_PER_TRADE   = 0.01
 MAX_NOTIONAL     = 10_000.0
 MAX_POSITIONS    = 3
 INITIAL_CAPITAL  = 100_000.0
-CANDLE_COOLDOWN  = 3
+
+# Cooldown settings
+CANDLE_COOLDOWN       = 3    # normal cooldown between trades
+WIN_COOLDOWN          = 7    # candles to wait after a TARGET hit (21 min)
+LOSS_COOLDOWN         = 10   # candles to wait after a STOP loss (30 min)
 
 CONSECUTIVE_LOSS_LIMIT = 3
 PAUSE_MINUTES          = 45
@@ -226,12 +236,8 @@ class SignalEngine:
         breakout_up = bool(don_high and price > don_high)
         breakout_dn = bool(don_low  and price < don_low)
         vol_ok      = bool(vol_r and vol_r >= VOLUME_THRESHOLD)
-
-        # FIX: allow EMA9 within 0.5% of EMA21
-        # Prevents missed trades after big overnight price moves
-        # when EMAs are still catching up to new price levels
-        ema_up = bool(e9 and e21 and e9 >= e21 * 0.995)
-        ema_dn = bool(e9 and e21 and e9 < e21)
+        ema_up      = bool(e9 and e21 and e9 >= e21 * 0.995)
+        ema_dn      = bool(e9 and e21 and e9 < e21)
 
         above_vwap = bool(vwap and price > vwap)
         below_vwap = bool(vwap and price < vwap)
@@ -338,6 +344,7 @@ class Portfolio:
         self.wins             = 0
         self.losses           = 0
         self.cooldowns        = {}
+        self.last_result      = {}   # asset → "WIN" or "LOSS"
         self.consecutive_loss = 0
         self.pause_until      = None
 
@@ -374,9 +381,17 @@ class Portfolio:
             return False, "in position"
         if len(self.positions) >= MAX_POSITIONS:
             return False, f"max {MAX_POSITIONS}"
+
         cd = self.cooldowns.get(asset, CANDLE_COOLDOWN)
+
+        # FIX: longer cooldown after a loss on this asset
+        if self.last_result.get(asset) == "LOSS" and cd < LOSS_COOLDOWN:
+            return False, f"loss cooldown ({LOSS_COOLDOWN - cd} candles left)"
+
+        # Normal cooldown
         if cd < CANDLE_COOLDOWN:
             return False, f"cooldown ({CANDLE_COOLDOWN - cd})"
+
         return True, "ok"
 
     def position_qty(self, price: float, atr: float) -> float:
@@ -410,9 +425,17 @@ class Portfolio:
         if pnl >= 0:
             self.wins             += 1
             self.consecutive_loss  = 0
+            self.last_result[asset] = "WIN"
+            # FIX: longer cooldown after a win — let the market breathe
+            # prevents immediately re-entering same asset after profit
+            self.cooldowns[asset] = WIN_COOLDOWN
         else:
             self.losses           += 1
             self.consecutive_loss += 1
+            self.last_result[asset] = "LOSS"
+            # FIX: reset cooldown to 0 so loss_cooldown check handles it
+            self.cooldowns[asset] = 0
+
             if self.consecutive_loss >= CONSECUTIVE_LOSS_LIMIT:
                 self.pause_until = (datetime.now(timezone.utc)
                                     + timedelta(minutes=PAUSE_MINUTES))
@@ -427,7 +450,6 @@ class Portfolio:
               f"{tag}: ${pnl:+.2f} | total: ${self.total_pnl:+.2f} | {reason}")
 
         self.logger.log_trade("CLOSE", asset, pos["qty"], price, pnl, reason)
-        self.cooldowns[asset] = 0
 
         if self.trade_count % 5 == 0:
             self.dashboard()
@@ -470,9 +492,21 @@ class AlpacaExecutor:
     def _place(self, asset: str, qty: float, side: OrderSide) -> bool:
         try:
             tif = TimeInForce.DAY if asset in STOCK_ASSETS else TimeInForce.GTC
+
+        # For SELL: get actual quantity from Alpaca to avoid insufficient balance
+            if side == OrderSide.SELL:
+                try:
+                    position = self.client.get_open_position(to_alpaca_symbol(asset))
+                    actual_qty = floor_qty(float(position.qty))
+                    safe_qty = actual_qty
+                except Exception:
+                    safe_qty = floor_qty(qty)  # fallback to our estimate
+            else:
+                safe_qty = floor_qty(qty)
+
             order = MarketOrderRequest(
                 symbol=to_alpaca_symbol(asset),
-                qty=floor_qty(qty),
+                qty=safe_qty,
                 side=side,
                 time_in_force=tif,
             )
@@ -749,7 +783,7 @@ class OvernightTrader:
                 t_ok  = "✓" if idict.get("trend_ok") else "✗"
                 b_ok  = "✓" if idict.get("breakout") else "✗"
                 v_ok  = "✓" if idict.get("vol_ok")   else "✗"
-                e_ok  = "✓" if idict.get("ema_ok")   else "✗"  # ← NEW
+                e_ok  = "✓" if idict.get("ema_ok")   else "✗"
 
                 pos_info = ""
                 if self.trades.has(asset):
@@ -761,7 +795,7 @@ class OvernightTrader:
                     f"ADX={adx_v:>5.1f}({t_ok}) "
                     f"broke({b_ok}) "
                     f"vol×{vol_r:.1f}({v_ok}) "
-                    f"ema({e_ok}) "          # ← NEW: now visible
+                    f"ema({e_ok}) "
                     f"ATR=${atr_v:,.2f}"
                     f"{pos_info}"
                 )
