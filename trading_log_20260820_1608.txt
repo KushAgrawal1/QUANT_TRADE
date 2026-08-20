@@ -2,3 +2,13 @@
 [16:08:18] Capital: $100,000.00
 [16:08:18] ============================================================
 [16:08:22] Trader started — overnight mode active
+[16:42:09] SIGNAL LONG   | ETH   | $2,337.7800 | ADX=35.8 vol=3.3x | AI=7/10 'AI error — proceeding (Unterminated string starting a)'
+[16:42:09] OPEN  | ETH   | qty=4.2775 | $2,337.7800
+[16:45:07] SIGNAL LONG   | BTC   | $72,595.9000 | ADX=27.3 vol=1.9x | AI=7/10 'Strong trending conditions with ADX 27.3, volume confirmation at 1.9x average, consistent higher highs/lows across last 5 candles, neutral fear/greed avoiding extremes, proper 2:1 risk/reward setup with stop below recent support'
+[16:45:07] OPEN  | BTC   | qty=0.1377 | $72,595.9000
+[16:55:01] CLOSE | ETH   | $2,337.6900 | LOSS: $-0.38 | STOP_LOSS
+[17:10:19] CLOSE | BTC   | $72,594.7000 | LOSS: $-0.17 | STOP_LOSS
+[18:29:34] Trader stopped by user
+[18:29:34] ────────────────────────────────────────────────────────────
+[18:29:34] SUMMARY | Capital=$99,999.45 | P&L=$-0.55 | Trades=2 (0W/2L) Win=0.0%
+[18:29:34] ────────────────────────────────────────────────────────────

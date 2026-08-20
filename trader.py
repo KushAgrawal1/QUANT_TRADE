@@ -72,8 +72,8 @@ LOSS_COOLDOWN         = 10   # candles to wait after a STOP loss (30 min)
 
 CONSECUTIVE_LOSS_LIMIT = 3
 PAUSE_MINUTES          = 45
-SLOW_MODE_CAPITAL      = 97_000.0
-HALT_CAPITAL           = 95_000.0
+SLOW_MODE_CAPITAL      = 98_000.0
+HALT_CAPITAL           = 96_000.0
 
 AI_CONFIDENCE_THRESHOLD = 7
 
@@ -338,7 +338,7 @@ class Portfolio:
     def __init__(self, logger: OvernightLogger):
         self.logger           = logger
         self.positions        = {}
-        self.capital          = INITIAL_CAPITAL
+        self.capital          = 101_300.0
         self.total_pnl        = 0.0
         self.trade_count      = 0
         self.wins             = 0
@@ -493,7 +493,7 @@ class AlpacaExecutor:
         try:
             tif = TimeInForce.DAY if asset in STOCK_ASSETS else TimeInForce.GTC
 
-        # For SELL: get actual quantity from Alpaca to avoid insufficient balance
+            # For SELL: get actual quantity from Alpaca to avoid insufficient balance
             if side == OrderSide.SELL:
                 try:
                     position = self.client.get_open_position(to_alpaca_symbol(asset))
