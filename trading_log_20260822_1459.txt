@@ -1,0 +1,6 @@
+[14:59:53] Session started: 2026-08-22T14:59:53.682581+00:00
+[14:59:53] Capital: $102,055.00
+[14:59:53] ============================================================
+[14:59:56] Trader started — overnight mode active
+[17:54:06] SIGNAL LONG   | AAVE  | $126.8400 | ADX=31.6 vol=5.6x | AI=7/10 'AI error — proceeding (Unterminated string starting a)'
+[17:54:07] OPEN  | AAVE  | qty=78.8394 | $126.8400

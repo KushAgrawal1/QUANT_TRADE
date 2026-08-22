@@ -1,18 +1,19 @@
 """
 trader.py — Overnight AI-Enhanced Momentum Trader
 
-Fixes in this version:
-  1. Longer cooldown after TARGET hit (7 candles = 21 min)
-     — prevents re-entering same asset immediately after profit
-     — morning BTC losses were caused by 3 back-to-back entries
-       on the same choppy breakout
-
-  2. Loss cooldown protection (10 candles = 30 min)
-     — after a STOP_LOSS on an asset, wait 30 min before re-entering
-     — prevents chasing a reversing market
-
-  3. Last trade result tracked per asset
-     — used for intelligent cooldown decisions
+Updates in this version:
+  1. Capital synced to $102,055 (actual Alpaca portfolio value)
+  2. Safety floors updated accordingly
+  3. Asset list cleaned up — removed low-ATR coins
+     Removed: DOGE, ADA, DOT, AVAX, XRP, LINK (ATR always < $0.50)
+     Added:   BCH (~$500), AAVE (~$88), XMR (~$180)
+  4. All previous fixes retained:
+     - Sell fetches actual Alpaca position qty (no insufficient balance errors)
+     - Win cooldown 7 candles (21 min)
+     - Loss cooldown 10 candles (30 min)
+     - EMA tolerance 0.995
+     - ema(✓/✗) visible in output
+     - Claude AI validation with robust JSON parsing
 """
 
 import os
@@ -42,7 +43,10 @@ KAFKA_CONF = {
 
 TOPICS = ["crypto-trades", "stock-trades"]
 
-CRYPTO_ASSETS = ["BTC", "ETH", "SOL", "DOGE", "LTC", "XRP", "ADA", "AVAX", "LINK", "DOT"]
+# Cleaned asset list — only coins with ATR > $0.50 on 3-min candles
+# Removed: DOGE, ADA, DOT, AVAX, XRP, LINK (all ATR < $0.50, always skipped)
+# Added:   BCH (~$500), AAVE (~$88), XMR (~$180) — all have meaningful ATR
+CRYPTO_ASSETS = ["BTC", "ETH", "SOL", "LTC", "BCH", "AAVE", "XMR"]
 STOCK_ASSETS  = ["AAPL", "NVDA", "TSLA", "AMZN"]
 ALL_ASSETS    = CRYPTO_ASSETS + STOCK_ASSETS
 
@@ -63,24 +67,29 @@ TARGET_ATR_MULT  = 3.0
 RISK_PER_TRADE   = 0.01
 MAX_NOTIONAL     = 10_000.0
 MAX_POSITIONS    = 3
-INITIAL_CAPITAL  = 100_000.0
 
-# Cooldown settings
-CANDLE_COOLDOWN       = 3    # normal cooldown between trades
-WIN_COOLDOWN          = 7    # candles to wait after a TARGET hit (21 min)
-LOSS_COOLDOWN         = 10   # candles to wait after a STOP loss (30 min)
+# Updated capital to match actual Alpaca portfolio value
+INITIAL_CAPITAL   = 102_055.0
+SLOW_MODE_CAPITAL =  99_000.0   # 3% below current — half position size
+HALT_CAPITAL      =  97_000.0   # 5% below current — full stop
+
+CANDLE_COOLDOWN        = 3
+WIN_COOLDOWN           = 7    # 21 min after target hit
+LOSS_COOLDOWN          = 10   # 30 min after stop loss
 
 CONSECUTIVE_LOSS_LIMIT = 3
 PAUSE_MINUTES          = 45
-SLOW_MODE_CAPITAL      = 98_000.0
-HALT_CAPITAL           = 96_000.0
-
 AI_CONFIDENCE_THRESHOLD = 7
 
+# Updated Kraken REST pairs for warmup
 KRAKEN_REST_PAIRS = {
-    "BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD",
-    "DOGE": "XDGUSD", "LTC": "LTCUSD", "XRP": "XRPUSD",
-    "ADA": "ADAUSD", "AVAX": "AVAXUSD", "LINK": "LINKUSD", "DOT": "DOTUSD",
+    "BTC":  "XBTUSD",
+    "ETH":  "ETHUSD",
+    "SOL":  "SOLUSD",
+    "LTC":  "LTCUSD",
+    "BCH":  "BCHUSD",
+    "AAVE": "AAVEUSD",
+    "XMR":  "XMRUSD",
 }
 
 
@@ -338,13 +347,13 @@ class Portfolio:
     def __init__(self, logger: OvernightLogger):
         self.logger           = logger
         self.positions        = {}
-        self.capital          = 101_300.0
+        self.capital          = INITIAL_CAPITAL
         self.total_pnl        = 0.0
         self.trade_count      = 0
         self.wins             = 0
         self.losses           = 0
         self.cooldowns        = {}
-        self.last_result      = {}   # asset → "WIN" or "LOSS"
+        self.last_result      = {}
         self.consecutive_loss = 0
         self.pause_until      = None
 
@@ -384,11 +393,9 @@ class Portfolio:
 
         cd = self.cooldowns.get(asset, CANDLE_COOLDOWN)
 
-        # FIX: longer cooldown after a loss on this asset
         if self.last_result.get(asset) == "LOSS" and cd < LOSS_COOLDOWN:
-            return False, f"loss cooldown ({LOSS_COOLDOWN - cd} candles left)"
+            return False, f"loss cooldown ({LOSS_COOLDOWN - cd} candles)"
 
-        # Normal cooldown
         if cd < CANDLE_COOLDOWN:
             return False, f"cooldown ({CANDLE_COOLDOWN - cd})"
 
@@ -423,18 +430,15 @@ class Portfolio:
         self.trade_count += 1
 
         if pnl >= 0:
-            self.wins             += 1
-            self.consecutive_loss  = 0
+            self.wins              += 1
+            self.consecutive_loss   = 0
             self.last_result[asset] = "WIN"
-            # FIX: longer cooldown after a win — let the market breathe
-            # prevents immediately re-entering same asset after profit
-            self.cooldowns[asset] = WIN_COOLDOWN
+            self.cooldowns[asset]   = WIN_COOLDOWN
         else:
-            self.losses           += 1
-            self.consecutive_loss += 1
+            self.losses            += 1
+            self.consecutive_loss  += 1
             self.last_result[asset] = "LOSS"
-            # FIX: reset cooldown to 0 so loss_cooldown check handles it
-            self.cooldowns[asset] = 0
+            self.cooldowns[asset]   = 0
 
             if self.consecutive_loss >= CONSECUTIVE_LOSS_LIMIT:
                 self.pause_until = (datetime.now(timezone.utc)
@@ -493,14 +497,14 @@ class AlpacaExecutor:
         try:
             tif = TimeInForce.DAY if asset in STOCK_ASSETS else TimeInForce.GTC
 
-            # For SELL: get actual quantity from Alpaca to avoid insufficient balance
+            # For SELL: fetch actual position qty from Alpaca
+            # Prevents "insufficient balance" errors from fill rounding
             if side == OrderSide.SELL:
                 try:
                     position = self.client.get_open_position(to_alpaca_symbol(asset))
-                    actual_qty = floor_qty(float(position.qty))
-                    safe_qty = actual_qty
+                    safe_qty = floor_qty(float(position.qty))
                 except Exception:
-                    safe_qty = floor_qty(qty)  # fallback to our estimate
+                    safe_qty = floor_qty(qty)
             else:
                 safe_qty = floor_qty(qty)
 
@@ -614,6 +618,8 @@ class OvernightTrader:
         ai_key = os.getenv("ANTHROPIC_API_KEY")
         print(f"  Fear & Greed    : {fg_val}/100 ({fg_label})")
         print(f"  Claude AI       : {'✓ enabled' if ai_key else '✗ not configured (optional)'}")
+        print(f"  Assets          : {CRYPTO_ASSETS}")
+        print(f"  Capital         : ${INITIAL_CAPITAL:,.2f}")
         print(f"  Log file        : {self.logger.filename}")
         print()
 

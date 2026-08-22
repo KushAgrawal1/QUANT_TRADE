@@ -1,9 +1,12 @@
 """
-producer.py — Kraken WebSocket → Kafka (10 crypto pairs)
+producer.py — Kraken WebSocket → Kafka
 
-Auto-reconnects on WebSocket disconnect — runs forever without manual restart.
-This was the root cause of no trades overnight: WebSocket dropped and
-the script exited instead of reconnecting.
+Updated asset list:
+  Removed: DOGE, ADA, DOT, AVAX, XRP, LINK (ATR always too small)
+  Added:   BCH (~$500), AAVE (~$88), XMR (~$180)
+  Kept:    BTC, ETH, SOL, LTC
+
+Auto-reconnects on WebSocket disconnect.
 """
 
 import json
@@ -26,13 +29,10 @@ PAIR_TO_COIN = {
     "XBT/USD":  "BTC",
     "ETH/USD":  "ETH",
     "SOL/USD":  "SOL",
-    "XDG/USD":  "DOGE",
     "LTC/USD":  "LTC",
-    "XRP/USD":  "XRP",
-    "ADA/USD":  "ADA",
-    "AVAX/USD": "AVAX",
-    "LINK/USD": "LINK",
-    "DOT/USD":  "DOT",
+    "BCH/USD":  "BCH",
+    "AAVE/USD": "AAVE",
+    "XMR/USD":  "XMR",
 }
 
 
@@ -90,19 +90,15 @@ def on_error(ws, error):
 
 def on_close(ws, *args):
     now = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    print(f"[{now}] WebSocket closed — will reconnect in 5 seconds...")
+    print(f"[{now}] WebSocket closed — reconnecting in 5 seconds...")
     producer.flush()
 
 
 def run():
-    """
-    Main loop — reconnects automatically on any disconnect or error.
-    Kraken WebSocket drops connections every few hours — this handles it.
-    """
-    retry_delay = 5    # seconds between reconnect attempts
-    max_delay   = 60   # cap backoff at 60 seconds
-
-    print("Starting 10-coin Kraken stream → Kafka (auto-reconnect enabled)\n")
+    retry_delay = 5
+    max_delay   = 60
+    print("Starting Kraken stream → Kafka (auto-reconnect enabled)")
+    print(f"Assets: {', '.join(PAIR_TO_COIN.values())}\n")
 
     while True:
         try:
@@ -114,21 +110,14 @@ def run():
                 on_close=on_close,
             )
             ws.run_forever(ping_interval=30, ping_timeout=10)
-
         except Exception as e:
             now = datetime.now(timezone.utc).strftime("%H:%M:%S")
             print(f"[{now}] Exception: {e}")
 
-        # Connection dropped — wait and reconnect
         now = datetime.now(timezone.utc).strftime("%H:%M:%S")
         print(f"[{now}] Reconnecting in {retry_delay}s...")
         time.sleep(retry_delay)
-
-        # Exponential backoff up to max_delay
         retry_delay = min(retry_delay * 2, max_delay)
-
-        # Reset delay after successful long connection
-        # (run_forever running > 60s means connection was healthy)
         retry_delay = 5
 
 
