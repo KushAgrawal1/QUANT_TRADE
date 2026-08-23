@@ -1,19 +1,34 @@
 """
-trader.py — Overnight AI-Enhanced Momentum Trader
+trader.py — Overnight AI-Enhanced Momentum Trader — BEST VERSION
 
-Updates in this version:
-  1. Capital synced to $102,055 (actual Alpaca portfolio value)
-  2. Safety floors updated accordingly
-  3. Asset list cleaned up — removed low-ATR coins
-     Removed: DOGE, ADA, DOT, AVAX, XRP, LINK (ATR always < $0.50)
-     Added:   BCH (~$500), AAVE (~$88), XMR (~$180)
-  4. All previous fixes retained:
-     - Sell fetches actual Alpaca position qty (no insufficient balance errors)
-     - Win cooldown 7 candles (21 min)
-     - Loss cooldown 10 candles (30 min)
-     - EMA tolerance 0.995
-     - ema(✓/✗) visible in output
-     - Claude AI validation with robust JSON parsing
+All fixes and improvements:
+  1. STARTUP POSITION CLEANUP
+     Closes all open Alpaca positions on startup.
+     Prevents position stacking when trader restarts mid-session.
+     This was causing AAVE to accumulate 381 units across 5 restarts.
+
+  2. CAPITAL SYNC FROM ALPACA
+     Reads actual portfolio value from Alpaca on startup.
+     No more manually updating INITIAL_CAPITAL after each session.
+
+  3. SELL QTY FIX
+     _close() passes qty=0, _place() fetches real Alpaca position qty.
+     Eliminates "insufficient balance" errors permanently.
+
+  4. WIN/LOSS COOLDOWNS
+     Win:  7 candles (21 min) — no re-entry after profit
+     Loss: 10 candles (30 min) — no chasing reversals
+
+  5. EMA TOLERANCE
+     EMA(9) >= EMA(21) * 0.995 — allows trade after big price moves
+
+  6. CLAUDE AI VALIDATION
+     max_tokens=200 — fixes unterminated JSON string error
+     Robust JSON extraction with regex
+
+  7. CLEAN ASSET LIST
+     BTC, ETH, SOL, LTC, BCH, AAVE, XMR
+     Removed: DOGE, ADA, DOT, AVAX, XRP, LINK (ATR always too small)
 """
 
 import os
@@ -43,9 +58,6 @@ KAFKA_CONF = {
 
 TOPICS = ["crypto-trades", "stock-trades"]
 
-# Cleaned asset list — only coins with ATR > $0.50 on 3-min candles
-# Removed: DOGE, ADA, DOT, AVAX, XRP, LINK (all ATR < $0.50, always skipped)
-# Added:   BCH (~$500), AAVE (~$88), XMR (~$180) — all have meaningful ATR
 CRYPTO_ASSETS = ["BTC", "ETH", "SOL", "LTC", "BCH", "AAVE", "XMR"]
 STOCK_ASSETS  = ["AAPL", "NVDA", "TSLA", "AMZN"]
 ALL_ASSETS    = CRYPTO_ASSETS + STOCK_ASSETS
@@ -68,20 +80,17 @@ RISK_PER_TRADE   = 0.01
 MAX_NOTIONAL     = 10_000.0
 MAX_POSITIONS    = 3
 
-# Updated capital to match actual Alpaca portfolio value
-INITIAL_CAPITAL   = 102_055.0
-SLOW_MODE_CAPITAL =  99_000.0   # 3% below current — half position size
-HALT_CAPITAL      =  97_000.0   # 5% below current — full stop
+# Safety floors — set relative to current capital, updated dynamically on startup
+DRAWDOWN_SLOW    = 0.03   # 3% below portfolio → half position size
+DRAWDOWN_HALT    = 0.05   # 5% below portfolio → full stop
 
 CANDLE_COOLDOWN        = 3
-WIN_COOLDOWN           = 7    # 21 min after target hit
-LOSS_COOLDOWN          = 10   # 30 min after stop loss
-
+WIN_COOLDOWN           = 7
+LOSS_COOLDOWN          = 10
 CONSECUTIVE_LOSS_LIMIT = 3
 PAUSE_MINUTES          = 45
 AI_CONFIDENCE_THRESHOLD = 7
 
-# Updated Kraken REST pairs for warmup
 KRAKEN_REST_PAIRS = {
     "BTC":  "XBTUSD",
     "ETH":  "ETHUSD",
@@ -116,7 +125,6 @@ class OvernightLogger:
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
         self.filename = f"trading_log_{ts}.txt"
         self._write(f"Session started: {datetime.now(timezone.utc).isoformat()}")
-        self._write(f"Capital: ${INITIAL_CAPITAL:,.2f}")
         self._write("=" * 60)
 
     def _write(self, msg: str):
@@ -139,13 +147,18 @@ class OvernightLogger:
             self._write(f"OPEN  | {asset:<5} | qty={qty} | ${price:,.4f}")
         else:
             tag = "PROFIT" if pnl >= 0 else "LOSS"
-            self._write(f"CLOSE | {asset:<5} | ${price:,.4f} | {tag}: ${pnl:+.2f} | {reason}")
+            self._write(
+                f"CLOSE | {asset:<5} | ${price:,.4f} | "
+                f"{tag}: ${pnl:+.2f} | {reason}"
+            )
 
     def log_summary(self, capital, pnl, trades, wins, losses):
         wr = (wins / trades * 100) if trades else 0
         self._write("─" * 60)
-        self._write(f"SUMMARY | Capital=${capital:,.2f} | P&L=${pnl:+.2f} | "
-                    f"Trades={trades} ({wins}W/{losses}L) Win={wr:.1f}%")
+        self._write(
+            f"SUMMARY | Capital=${capital:,.2f} | P&L=${pnl:+.2f} | "
+            f"Trades={trades} ({wins}W/{losses}L) Win={wr:.1f}%"
+        )
         self._write("─" * 60)
 
 
@@ -195,7 +208,9 @@ class VWAPTracker:
         self.data[asset]["cum_pv"]  += typical * vol
         self.data[asset]["cum_vol"] += vol
         if self.data[asset]["cum_vol"] > 0:
-            return round(self.data[asset]["cum_pv"] / self.data[asset]["cum_vol"], 4)
+            return round(
+                self.data[asset]["cum_pv"] / self.data[asset]["cum_vol"], 4
+            )
         return None
 
 
@@ -228,18 +243,21 @@ class SignalEngine:
                  "low": lows[i], "close": closes[i]}
                 for i in range(len(closes))]
 
-    def analyse(self, asset: str, price: float, vwap: float | None = None) -> tuple:
+    def analyse(self, asset: str, price: float,
+                vwap: float | None = None) -> tuple:
         closes  = list(self.closes[asset])
         highs   = list(self.highs[asset])
         lows    = list(self.lows[asset])
         volumes = list(self.volumes[asset])
 
         adx_val, adx_rising = ind.adx(highs, lows, closes)
-        don_high, don_low   = ind.donchian_channel(highs[:-1], lows[:-1], period=DONCHIAN_PERIOD)
-        vol_r               = ind.volume_ratio(volumes, period=VOLUME_PERIOD)
-        e9                  = ind.ema(closes, 9)
-        e21                 = ind.ema(closes, 21)
-        atr_val             = ind.atr(highs, lows, closes)
+        don_high, don_low   = ind.donchian_channel(
+            highs[:-1], lows[:-1], period=DONCHIAN_PERIOD
+        )
+        vol_r    = ind.volume_ratio(volumes, period=VOLUME_PERIOD)
+        e9       = ind.ema(closes, 9)
+        e21      = ind.ema(closes, 21)
+        atr_val  = ind.atr(highs, lows, closes)
 
         trend_ok    = bool(adx_val and adx_val > ADX_THRESHOLD and adx_rising)
         breakout_up = bool(don_high and price > don_high)
@@ -285,17 +303,23 @@ class TradeManager:
     def __init__(self):
         self.trades = {}
 
-    def open(self, asset: str, entry: float, atr: float, direction: str = "LONG"):
-        stop    = entry - STOP_ATR_MULT   * atr if direction == "LONG" else entry + STOP_ATR_MULT   * atr
-        target  = entry + TARGET_ATR_MULT * atr if direction == "LONG" else entry - TARGET_ATR_MULT * atr
-        be_trig = entry + STOP_ATR_MULT   * atr if direction == "LONG" else entry - STOP_ATR_MULT   * atr
+    def open(self, asset: str, entry: float, atr: float,
+             direction: str = "LONG"):
+        stop    = (entry - STOP_ATR_MULT   * atr if direction == "LONG"
+                   else entry + STOP_ATR_MULT   * atr)
+        target  = (entry + TARGET_ATR_MULT * atr if direction == "LONG"
+                   else entry - TARGET_ATR_MULT * atr)
+        be_trig = (entry + STOP_ATR_MULT   * atr if direction == "LONG"
+                   else entry - STOP_ATR_MULT   * atr)
         self.trades[asset] = {
             "entry": entry, "stop": stop, "target": target,
             "be_trigger": be_trig, "atr": atr,
             "direction": direction, "stage": 0,
         }
-        print(f"  [SET] {asset} {direction} | entry=${entry:,.4f} | "
-              f"stop=${stop:,.4f} | target=${target:,.4f} | R:R=2:1")
+        print(
+            f"  [SET] {asset} {direction} | entry=${entry:,.4f} | "
+            f"stop=${stop:,.4f} | target=${target:,.4f} | R:R=2:1"
+        )
 
     def update_breakeven(self, asset: str, price: float):
         if asset not in self.trades:
@@ -306,7 +330,10 @@ class TradeManager:
                     (t["direction"] == "SHORT" and price <= t["be_trigger"])):
                 t["stop"]  = t["entry"]
                 t["stage"] = 1
-                print(f"  [BREAKEVEN] {asset} → free trade, stop=${t['entry']:,.4f}")
+                print(
+                    f"  [BREAKEVEN] {asset} → "
+                    f"free trade, stop=${t['entry']:,.4f}"
+                )
 
     def check_tick(self, asset: str, price: float) -> str:
         if asset not in self.trades:
@@ -323,7 +350,8 @@ class TradeManager:
     def check_adx_exit(self, asset: str, adx_val: float | None) -> bool:
         if asset not in self.trades or adx_val is None:
             return False
-        return self.trades[asset]["stage"] >= 1 and adx_val < ADX_EXIT_LEVEL
+        return (self.trades[asset]["stage"] >= 1
+                and adx_val < ADX_EXIT_LEVEL)
 
     def direction(self, asset: str) -> str:
         return self.trades.get(asset, {}).get("direction", "LONG")
@@ -344,10 +372,11 @@ class TradeManager:
 # ── Portfolio Manager ─────────────────────────────────────────────────────────
 
 class Portfolio:
-    def __init__(self, logger: OvernightLogger):
+    def __init__(self, logger: OvernightLogger, initial_capital: float):
         self.logger           = logger
         self.positions        = {}
-        self.capital          = INITIAL_CAPITAL
+        self.capital          = initial_capital
+        self.initial_capital  = initial_capital
         self.total_pnl        = 0.0
         self.trade_count      = 0
         self.wins             = 0
@@ -356,6 +385,10 @@ class Portfolio:
         self.last_result      = {}
         self.consecutive_loss = 0
         self.pause_until      = None
+
+        # Dynamic safety floors based on actual capital
+        self.slow_mode_floor = initial_capital * (1 - DRAWDOWN_SLOW)
+        self.halt_floor      = initial_capital * (1 - DRAWDOWN_HALT)
 
     def has(self, asset: str) -> bool:
         return asset in self.positions
@@ -380,25 +413,26 @@ class Portfolio:
         return True
 
     def in_slow_mode(self) -> bool:
-        return HALT_CAPITAL <= self.capital < SLOW_MODE_CAPITAL
+        return self.halt_floor <= self.capital < self.slow_mode_floor
+
+    def max_drawdown_hit(self) -> bool:
+        return self.capital < self.halt_floor
 
     def can_open(self, asset: str) -> tuple[bool, str]:
         if self.is_paused():
-            remaining = (self.pause_until - datetime.now(timezone.utc)).seconds // 60
+            remaining = (
+                self.pause_until - datetime.now(timezone.utc)
+            ).seconds // 60
             return False, f"paused ({remaining}min left)"
         if self.has(asset):
             return False, "in position"
         if len(self.positions) >= MAX_POSITIONS:
             return False, f"max {MAX_POSITIONS}"
-
         cd = self.cooldowns.get(asset, CANDLE_COOLDOWN)
-
         if self.last_result.get(asset) == "LOSS" and cd < LOSS_COOLDOWN:
             return False, f"loss cooldown ({LOSS_COOLDOWN - cd} candles)"
-
         if cd < CANDLE_COOLDOWN:
             return False, f"cooldown ({CANDLE_COOLDOWN - cd})"
-
         return True, "ok"
 
     def position_qty(self, price: float, atr: float) -> float:
@@ -411,18 +445,25 @@ class Portfolio:
         qty    = min(qty, MAX_NOTIONAL / price)
         return floor_qty(qty)
 
-    def open(self, asset: str, qty: float, price: float, atr: float, direction: str):
-        self.positions[asset] = {"qty": qty, "entry": price, "atr": atr, "direction": direction}
+    def open(self, asset: str, qty: float, price: float,
+             atr: float, direction: str):
+        self.positions[asset] = {
+            "qty": qty, "entry": price,
+            "atr": atr, "direction": direction,
+        }
         self.cooldowns[asset] = 0
         self.logger.log_trade("OPEN", asset, qty, price)
-        print(f"\n  [OPEN] {asset:<5} {direction:<6} | qty={qty} | "
-              f"${price:,.4f} | open={len(self.positions)}/{MAX_POSITIONS}")
+        print(
+            f"\n  [OPEN] {asset:<5} {direction:<6} | qty={qty} | "
+            f"${price:,.4f} | open={len(self.positions)}/{MAX_POSITIONS}"
+        )
 
     def close(self, asset: str, price: float, reason: str) -> float:
         if not self.has(asset):
             return 0
         pos = self.positions.pop(asset)
-        pnl = ((price - pos["entry"]) * pos["qty"] if pos["direction"] == "LONG"
+        pnl = ((price - pos["entry"]) * pos["qty"]
+               if pos["direction"] == "LONG"
                else (pos["entry"] - price) * pos["qty"])
 
         self.total_pnl   += pnl
@@ -439,20 +480,26 @@ class Portfolio:
             self.consecutive_loss  += 1
             self.last_result[asset] = "LOSS"
             self.cooldowns[asset]   = 0
-
             if self.consecutive_loss >= CONSECUTIVE_LOSS_LIMIT:
-                self.pause_until = (datetime.now(timezone.utc)
-                                    + timedelta(minutes=PAUSE_MINUTES))
-                msg = (f"{CONSECUTIVE_LOSS_LIMIT} consecutive losses — "
-                       f"pausing {PAUSE_MINUTES}min until "
-                       f"{self.pause_until.strftime('%H:%M UTC')}")
+                self.pause_until = (
+                    datetime.now(timezone.utc)
+                    + timedelta(minutes=PAUSE_MINUTES)
+                )
+                msg = (
+                    f"{CONSECUTIVE_LOSS_LIMIT} consecutive losses — "
+                    f"pausing {PAUSE_MINUTES}min until "
+                    f"{self.pause_until.strftime('%H:%M UTC')}"
+                )
                 print(f"\n  [PAUSE] {msg}")
                 self.logger.log(f"PAUSE | {msg}")
 
         tag = "PROFIT" if pnl >= 0 else "LOSS  "
-        print(f"\n  [CLOSE] {asset:<5} | entry=${pos['entry']:,.4f} → ${price:,.4f} | "
-              f"{tag}: ${pnl:+.2f} | total: ${self.total_pnl:+.2f} | {reason}")
-
+        print(
+            f"\n  [CLOSE] {asset:<5} | "
+            f"entry=${pos['entry']:,.4f} → ${price:,.4f} | "
+            f"{tag}: ${pnl:+.2f} | "
+            f"total: ${self.total_pnl:+.2f} | {reason}"
+        )
         self.logger.log_trade("CLOSE", asset, pos["qty"], price, pnl, reason)
 
         if self.trade_count % 5 == 0:
@@ -460,25 +507,28 @@ class Portfolio:
 
         return pnl
 
-    def max_drawdown_hit(self) -> bool:
-        return self.capital < HALT_CAPITAL
-
     def dashboard(self):
         wr   = (self.wins / self.trade_count * 100) if self.trade_count else 0
-        dd   = max(0, (INITIAL_CAPITAL - self.capital) / INITIAL_CAPITAL * 100)
+        dd   = max(
+            0, (self.initial_capital - self.capital) / self.initial_capital * 100
+        )
         mode = " [SLOW MODE]" if self.in_slow_mode() else ""
         print("\n" + "═" * 68)
         print(f"  OVERNIGHT TRADER DASHBOARD{mode}")
         print("═" * 68)
-        print(f"  Capital  : ${self.capital:>12,.2f}")
+        print(f"  Capital  : ${self.capital:>12,.2f}  "
+              f"(started ${self.initial_capital:,.2f})")
         print(f"  P&L      : ${self.total_pnl:>+12.2f}")
         print(f"  Drawdown : {dd:.2f}%")
-        print(f"  Trades   : {self.trade_count} ({self.wins}W/{self.losses}L) Win: {wr:.1f}%")
+        print(f"  Trades   : {self.trade_count} "
+              f"({self.wins}W/{self.losses}L) Win: {wr:.1f}%")
         print(f"  Open     : {list(self.positions.keys()) or 'None'}")
         print(f"  Log file : {self.logger.filename}")
         print("═" * 68 + "\n")
-        self.logger.log_summary(self.capital, self.total_pnl,
-                                self.trade_count, self.wins, self.losses)
+        self.logger.log_summary(
+            self.capital, self.total_pnl,
+            self.trade_count, self.wins, self.losses,
+        )
 
 
 # ── Alpaca Executor ───────────────────────────────────────────────────────────
@@ -491,20 +541,67 @@ class AlpacaExecutor:
             paper=True,
         )
         account = self.client.get_account()
-        print(f"  Alpaca | Paper capital: ${float(account.cash):,.2f}\n")
+        print(f"  Alpaca | Cash: ${float(account.cash):,.2f} | "
+              f"Portfolio: ${float(account.portfolio_value):,.2f}\n")
+
+    def get_portfolio_value(self) -> float:
+        try:
+            return float(self.client.get_account().portfolio_value)
+        except Exception:
+            return 0.0
+
+    def close_all_positions(self):
+        """
+        Close all open Alpaca positions on startup.
+        Prevents position stacking when trader restarts mid-session.
+        This was the root cause of AAVE accumulating 381 units.
+        """
+        try:
+            positions = self.client.get_all_positions()
+            if not positions:
+                print("  [STARTUP] No open positions found — clean slate\n")
+                return
+            print(f"\n  [STARTUP CLEANUP] {len(positions)} open position(s) found:")
+            for pos in positions:
+                pnl = float(pos.unrealized_pl)
+                print(
+                    f"    Closing {pos.symbol:<12} | "
+                    f"qty={float(pos.qty):.4f} | "
+                    f"P&L=${pnl:+.2f}"
+                )
+                self.client.close_position(pos.symbol)
+            print("  [STARTUP CLEANUP] All positions closed — starting fresh\n")
+        except Exception as e:
+            print(f"  [STARTUP CLEANUP] Error: {e}\n")
 
     def _place(self, asset: str, qty: float, side: OrderSide) -> bool:
+        """
+        For SELL orders: always fetch actual Alpaca position qty.
+        Alpaca fills buys at slightly different qty (e.g. 78.6817 vs 78.8394).
+        Using our stored qty for sells causes "insufficient balance".
+        Fetching real qty eliminates this permanently.
+        """
         try:
             tif = TimeInForce.DAY if asset in STOCK_ASSETS else TimeInForce.GTC
 
-            # For SELL: fetch actual position qty from Alpaca
-            # Prevents "insufficient balance" errors from fill rounding
             if side == OrderSide.SELL:
                 try:
-                    position = self.client.get_open_position(to_alpaca_symbol(asset))
+                    position = self.client.get_open_position(
+                        to_alpaca_symbol(asset)
+                    )
                     safe_qty = floor_qty(float(position.qty))
+                    if safe_qty <= 0:
+                        print(
+                            f"  [ALPACA] No position for {asset} "
+                            f"— skipping sell"
+                        )
+                        return True
                 except Exception:
-                    safe_qty = floor_qty(qty)
+                    print(
+                        f"  [ALPACA] Position not found for {asset} "
+                        f"— skipping sell"
+                    )
+                    return True
             else:
                 safe_qty = floor_qty(qty)
 
@@ -515,8 +612,12 @@ class AlpacaExecutor:
                 time_in_force=tif,
             )
             r = self.client.submit_order(order)
-            print(f"  [ALPACA] {side.value.upper():<5} | id={str(r.id)[:8]}...")
+            print(
+                f"  [ALPACA] {side.value.upper():<5} | "
+                f"qty={safe_qty} | id={str(r.id)[:8]}..."
+            )
             return True
+
         except Exception as e:
             print(f"  [ALPACA ERROR] {side.value} {asset}: {e}")
             return False
@@ -537,7 +638,7 @@ def warmup_crypto(engine) -> int:
         try:
             resp = requests.get(
                 "https://api.kraken.com/0/public/OHLC",
-                params={"pair": pair, "interval": 1}, timeout=10
+                params={"pair": pair, "interval": 1}, timeout=10,
             )
             data = resp.json()
             if data.get("error") and data["error"]:
@@ -562,7 +663,10 @@ def warmup_crypto(engine) -> int:
                 i -= 1
             for c in three_min:
                 engine.add_candle(coin, c)
-            print(f"  ✓ {coin:<5} {len(three_min)} candles | ${three_min[-1]['close']:,.4f}")
+            print(
+                f"  ✓ {coin:<5} {len(three_min)} candles | "
+                f"${three_min[-1]['close']:,.4f}"
+            )
             warmed += 1
         except Exception as e:
             print(f"  ✗ {coin}: {e}")
@@ -576,14 +680,19 @@ def warmup_stocks(engine) -> int:
         return 0
     print("\nFetching stock history from Alpaca Data API...")
     warmed  = 0
-    headers = {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret_key}
+    headers = {
+        "APCA-API-KEY-ID":     api_key,
+        "APCA-API-SECRET-KEY": secret_key,
+    }
     for stock in STOCK_ASSETS:
         try:
             resp = requests.get(
                 f"https://data.alpaca.markets/v2/stocks/{stock}/bars",
                 headers=headers,
-                params={"timeframe": "3Min", "limit": WARMUP_CANDLES,
-                        "feed": "iex", "sort": "asc"},
+                params={
+                    "timeframe": "3Min", "limit": WARMUP_CANDLES,
+                    "feed": "iex", "sort": "asc",
+                },
                 timeout=10,
             )
             bars = resp.json().get("bars", [])
@@ -591,10 +700,15 @@ def warmup_stocks(engine) -> int:
                 print(f"  ✗ {stock}: no data (market closed?)")
                 continue
             for b in bars:
-                engine.add_candle(stock, {"open": b["o"], "high": b["h"],
-                                          "low": b["l"], "close": b["c"],
-                                          "volume": b["v"]})
-            print(f"  ✓ {stock:<5} {len(bars)} bars | ${bars[-1]['c']:,.3f}")
+                engine.add_candle(stock, {
+                    "open": b["o"], "high": b["h"],
+                    "low":  b["l"], "close": b["c"],
+                    "volume": b["v"],
+                })
+            print(
+                f"  ✓ {stock:<5} {len(bars)} bars | "
+                f"${bars[-1]['c']:,.3f}"
+            )
             warmed += 1
         except Exception as e:
             print(f"  ✗ {stock}: {e}")
@@ -605,21 +719,48 @@ def warmup_stocks(engine) -> int:
 
 class OvernightTrader:
     def __init__(self):
-        self.logger    = OvernightLogger()
+        self.logger = OvernightLogger()
+        self.alpaca = AlpacaExecutor()
+
+        # FIX: Close all existing positions on startup
+        # Prevents position stacking across restarts
+        self.alpaca.close_all_positions()
+
+        # FIX: Sync capital from actual Alpaca portfolio value
+        real_capital = self.alpaca.get_portfolio_value()
+        if real_capital > 0:
+            print(f"  Capital synced    : ${real_capital:,.2f} (from Alpaca)")
+        else:
+            real_capital = 102_055.0
+            print(f"  Capital synced    : ${real_capital:,.2f} (default)")
+
         self.consumer  = Consumer(KAFKA_CONF)
         self.candles   = CandleBuilder()
         self.vwap      = VWAPTracker()
         self.engine    = SignalEngine()
         self.trades    = TradeManager()
-        self.portfolio = Portfolio(self.logger)
-        self.alpaca    = AlpacaExecutor()
+        self.portfolio = Portfolio(self.logger, real_capital)
 
         fg_val, fg_label = ai.get_fear_greed()
         ai_key = os.getenv("ANTHROPIC_API_KEY")
+
+        self.logger.log(f"Capital: ${real_capital:,.2f}")
+        self.logger.log(
+            f"Safety: slow_mode<${self.portfolio.slow_mode_floor:,.0f} "
+            f"halt<${self.portfolio.halt_floor:,.0f}"
+        )
+
         print(f"  Fear & Greed    : {fg_val}/100 ({fg_label})")
-        print(f"  Claude AI       : {'✓ enabled' if ai_key else '✗ not configured (optional)'}")
+        print(
+            f"  Claude AI       : "
+            f"{'✓ enabled' if ai_key else '✗ not configured (optional)'}"
+        )
         print(f"  Assets          : {CRYPTO_ASSETS}")
-        print(f"  Capital         : ${INITIAL_CAPITAL:,.2f}")
+        print(
+            f"  Safety floors   : "
+            f"slow=${self.portfolio.slow_mode_floor:,.0f} | "
+            f"halt=${self.portfolio.halt_floor:,.0f}"
+        )
         print(f"  Log file        : {self.logger.filename}")
         print()
 
@@ -639,7 +780,6 @@ class OvernightTrader:
             return
 
         is_crypto = asset in CRYPTO_ASSETS
-
         fg_ok, fg_reason = ai.fear_greed_filter(direction, is_crypto)
         if not fg_ok:
             print(f"  [F&G SKIP] {asset} — {fg_reason}")
@@ -656,17 +796,24 @@ class OvernightTrader:
             fear_greed_val=fg_val,
         )
 
-        self.logger.log_signal(asset, direction, price,
-                               signal_idict.get("adx") or 0,
-                               signal_idict.get("vol_ratio") or 0,
-                               confidence, ai_reason)
+        self.logger.log_signal(
+            asset, direction, price,
+            signal_idict.get("adx") or 0,
+            signal_idict.get("vol_ratio") or 0,
+            confidence, ai_reason,
+        )
 
         if not execute or confidence < AI_CONFIDENCE_THRESHOLD:
-            print(f"  [AI SKIP] {asset} {direction} | "
-                  f"confidence={confidence}/10 '{ai_reason}'")
+            print(
+                f"  [AI SKIP] {asset} {direction} | "
+                f"confidence={confidence}/10 '{ai_reason}'"
+            )
             return
 
-        print(f"  [AI OK] {asset} {direction} | confidence={confidence}/10 '{ai_reason}'")
+        print(
+            f"  [AI OK] {asset} {direction} | "
+            f"confidence={confidence}/10 '{ai_reason}'"
+        )
 
         qty = self.portfolio.position_qty(price, atr)
         if qty <= 0:
@@ -680,12 +827,11 @@ class OvernightTrader:
     def _close(self, asset: str, price: float, reason: str):
         if not self.portfolio.has(asset):
             return
-        qty       = self.portfolio.qty(asset)
         direction = self.trades.direction(asset)
         self.portfolio.close(asset, price, reason)
         self.trades.clear(asset)
         side = OrderSide.SELL if direction == "LONG" else OrderSide.BUY
-        self.alpaca._place(asset, qty, side)
+        self.alpaca._place(asset, 0, side)
 
     def _close_stocks_at_market_close(self):
         if is_us_market_hours():
@@ -708,13 +854,19 @@ class OvernightTrader:
         print(f"  Ready:  {ready}\n")
 
         self.consumer.subscribe(TOPICS, on_assign=self._on_assign)
-        print("Overnight Trader | AI-Validated | Fear&Greed | Safety Features\n")
-        self.logger.log("Trader started — overnight mode active")
+        print(
+            "Overnight Trader | AI-Validated | Fear&Greed | "
+            "Auto-Cleanup | Capital-Synced\n"
+        )
+        self.logger.log("Trader started")
 
         try:
             while True:
                 if self.portfolio.max_drawdown_hit():
-                    msg = f"Capital ${self.portfolio.capital:,.2f} < ${HALT_CAPITAL:,.2f} — HALTED"
+                    msg = (
+                        f"Capital ${self.portfolio.capital:,.2f} < "
+                        f"${self.portfolio.halt_floor:,.2f} — HALTED"
+                    )
                     print(f"\n  [HALT] {msg}")
                     self.logger.log(f"HALT | {msg}")
                     self.portfolio.dashboard()
@@ -740,6 +892,7 @@ class OvernightTrader:
                     self.consumer.commit(asynchronous=False)
                     continue
 
+                # Real-time stop/target on every tick
                 if self.trades.has(asset):
                     self.trades.update_breakeven(asset, price)
                     outcome = self.trades.check_tick(asset, price)
@@ -754,6 +907,7 @@ class OvernightTrader:
                         self.consumer.commit(asynchronous=False)
                         continue
 
+                # Build candle
                 completed = self.candles.update(asset, price, volume)
                 if completed is None:
                     self.consumer.commit(asynchronous=False)
@@ -770,17 +924,22 @@ class OvernightTrader:
                     self.consumer.commit(asynchronous=False)
                     continue
 
+                # ADX exit
                 if self.trades.has(asset):
                     adx_now = self.engine.adx_value(asset)
                     if self.trades.check_adx_exit(asset, adx_now):
-                        print(f"\n  [ADX EXIT] {asset} | ADX={adx_now:.1f} trend dying")
+                        print(
+                            f"\n  [ADX EXIT] {asset} | "
+                            f"ADX={adx_now:.1f} trend dying"
+                        )
                         self._close(asset, completed["close"], "ADX_EXIT")
                         self.consumer.commit(asynchronous=False)
                         continue
 
+                # Signal
                 signal, idict = self.engine.analyse(
                     asset, completed["close"],
-                    vwap=vwap_val if asset in STOCK_ASSETS else None
+                    vwap=vwap_val if asset in STOCK_ASSETS else None,
                 )
 
                 adx_v = idict.get("adx") or 0
@@ -793,8 +952,10 @@ class OvernightTrader:
 
                 pos_info = ""
                 if self.trades.has(asset):
-                    pos_info = (f" | tgt=${self.trades.target_price(asset):,.3f} "
-                                f"stp=${self.trades.stop_price(asset):,.3f}")
+                    pos_info = (
+                        f" | tgt=${self.trades.target_price(asset):,.3f} "
+                        f"stp=${self.trades.stop_price(asset):,.3f}"
+                    )
 
                 print(
                     f"  {asset:<5} | ${completed['close']:>10,.3f} | "
@@ -807,14 +968,24 @@ class OvernightTrader:
                 )
 
                 if signal == "BUY" and not self.portfolio.has(asset):
-                    print(f"\n  *** LONG BREAKOUT *** {asset} | "
-                          f"${completed['close']:,.3f} | ADX={adx_v:.1f} | vol={vol_r:.1f}x")
-                    self._open(asset, completed["close"], atr_v, "LONG", idict)
+                    print(
+                        f"\n  *** LONG BREAKOUT *** {asset} | "
+                        f"${completed['close']:,.3f} | "
+                        f"ADX={adx_v:.1f} | vol={vol_r:.1f}x"
+                    )
+                    self._open(
+                        asset, completed["close"], atr_v, "LONG", idict
+                    )
 
                 elif signal == "SHORT" and not self.portfolio.has(asset):
-                    print(f"\n  *** SHORT BREAKDOWN *** {asset} | "
-                          f"${completed['close']:,.3f} | ADX={adx_v:.1f} | vol={vol_r:.1f}x")
-                    self._open(asset, completed["close"], atr_v, "SHORT", idict)
+                    print(
+                        f"\n  *** SHORT BREAKDOWN *** {asset} | "
+                        f"${completed['close']:,.3f} | "
+                        f"ADX={adx_v:.1f} | vol={vol_r:.1f}x"
+                    )
+                    self._open(
+                        asset, completed["close"], atr_v, "SHORT", idict
+                    )
 
                 self.consumer.commit(asynchronous=False)
 
