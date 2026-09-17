@@ -1,23 +1,37 @@
 #!/bin/bash
 echo "Starting all services..."
 
+PIDS=()
+
+cleanup() {
+    echo ""
+    echo "Stopping all services..."
+    for pid in "${PIDS[@]}"; do
+        kill "$pid" 2>/dev/null
+    done
+    wait 2>/dev/null
+    echo "All services stopped."
+    exit 0
+}
+trap cleanup INT TERM
+
 # Start producer in background
 python producer.py &
-PRODUCER_PID=$!
-echo "Producer started (PID $PRODUCER_PID)"
+PIDS+=($!)
+echo "Producer started (PID ${PIDS[-1]})"
 
-# Start stock producer in background  
+# Start stock producer in background
 python stock_producer.py &
-STOCK_PID=$!
-echo "Stock producer started (PID $STOCK_PID)"
+PIDS+=($!)
+echo "Stock producer started (PID ${PIDS[-1]})"
 
 # Wait 3 seconds then start trader
 sleep 3
 python trader.py &
-TRADER_PID=$!
-echo "Trader started (PID $TRADER_PID)"
+PIDS+=($!)
+echo "Trader started (PID ${PIDS[-1]})"
 
 echo "All services running. Press Ctrl+C to stop all."
 
-# If any process dies, kill everything and restart
+# Wait on all children; Ctrl+C triggers cleanup() which kills them all
 wait
