@@ -1,1 +1,7 @@
 .env
+__pycache__/
+*.pyc
+.DS_Store
+trading_log_*.txt
+.venv/
+venv/
