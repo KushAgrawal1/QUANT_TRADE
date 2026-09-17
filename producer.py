@@ -25,6 +25,8 @@ conf = {
 producer = Producer(conf)
 TOPIC = "crypto-trades"
 
+retry_delay = 5
+
 PAIR_TO_COIN = {
     "XBT/USD":  "BTC",
     "ETH/USD":  "ETH",
@@ -42,6 +44,8 @@ def on_delivery(err, msg):
 
 
 def on_open(ws):
+    global retry_delay
+    retry_delay = 5  # reset backoff after a successful (re)connect
     now = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"[{now}] Connected to Kraken WebSocket")
     ws.send(json.dumps({
@@ -93,10 +97,9 @@ def on_close(ws, *args):
     print(f"[{now}] WebSocket closed — reconnecting in 5 seconds...")
     producer.flush()
 
-
 def run():
-    retry_delay = 5
-    max_delay   = 60
+    global retry_delay
+    max_delay = 60
     print("Starting Kraken stream → Kafka (auto-reconnect enabled)")
     print(f"Assets: {', '.join(PAIR_TO_COIN.values())}\n")
 
@@ -118,7 +121,6 @@ def run():
         print(f"[{now}] Reconnecting in {retry_delay}s...")
         time.sleep(retry_delay)
         retry_delay = min(retry_delay * 2, max_delay)
-        retry_delay = 5
 
 
 if __name__ == "__main__":
