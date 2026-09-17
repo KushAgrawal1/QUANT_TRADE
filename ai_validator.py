@@ -99,7 +99,7 @@ def validate_with_claude(
         return True, 7, "AI validation skipped (not configured)"
 
     try:
-        client = anthropic.Anthropic(api_key=api_key)
+        client = anthropic.Anthropic(api_key=api_key, timeout=8.0, max_retries=1)
 
         candle_lines = "\n".join([
             f"  {i+1}. O={c['open']:.4f} H={c['high']:.4f} "
@@ -148,4 +148,8 @@ Format: {{"execute": true, "confidence": 8, "reason": "brief reason"}}"""
         return execute, confidence, reason
 
     except Exception as e:
-        return True, 7, f"AI error — proceeding ({str(e)[:30]})"
+        # FAIL CLOSED. This previously returned (True, 7, ...) which passes
+        # the >= 7 confidence threshold, so any API timeout, rate limit or
+        # network blip silently became "yes, take this trade". An unvalidated
+        # signal during an outage is exactly when you least want to be filled.
+        return False, 0, f"AI error - skipping trade ({str(e)[:40]})"
