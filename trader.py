@@ -36,6 +36,7 @@ import json
 import requests
 from collections import deque
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from confluent_kafka import Consumer, KafkaError
 from alpaca.trading.client import TradingClient
@@ -106,9 +107,17 @@ def to_alpaca_symbol(asset: str) -> str:
     return f"{asset}/USD" if asset in CRYPTO_ASSETS else asset
 
 
+NY_TZ = ZoneInfo("America/New_York")
+
+
 def is_us_market_hours() -> bool:
-    utc = datetime.now(timezone.utc)
-    ny  = utc + timedelta(hours=-4)
+    """
+    True during 9:45 AM - 3:30 PM Eastern on weekdays.
+    Uses America/New_York so this stays correct across the EST/EDT
+    daylight-saving transitions instead of assuming a fixed UTC-4 offset
+    (which was wrong for roughly half the year).
+    """
+    ny = datetime.now(timezone.utc).astimezone(NY_TZ)
     if ny.weekday() >= 5:
         return False
     return ny.replace(hour=9, minute=45) <= ny <= ny.replace(hour=15, minute=30)
@@ -535,12 +544,23 @@ class Portfolio:
 
 class AlpacaExecutor:
     def __init__(self):
-        self.client = TradingClient(
-            os.getenv("ALPACA_API_KEY"),
-            os.getenv("ALPACA_SECRET_KEY"),
-            paper=True,
-        )
-        account = self.client.get_account()
+        api_key    = os.getenv("ALPACA_API_KEY")
+        secret_key = os.getenv("ALPACA_SECRET_KEY")
+        if not api_key or not secret_key:
+            raise RuntimeError(
+                "ALPACA_API_KEY / ALPACA_SECRET_KEY are not set. "
+                "Add them to your .env file before starting the trader."
+            )
+
+        self.client = TradingClient(api_key, secret_key, paper=True)
+        try:
+            account = self.client.get_account()
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not connect to Alpaca - check your API keys "
+                f"and that they're for a paper account: {e}"
+            ) from e
+
         print(f"  Alpaca | Cash: ${float(account.cash):,.2f} | "
               f"Portfolio: ${float(account.portfolio_value):,.2f}\n")
 
@@ -880,7 +900,13 @@ class OvernightTrader:
                         print(f"  Kafka error: {msg.error()}")
                     continue
 
-                data   = json.loads(msg.value().decode("utf-8"))
+                try:
+                    data = json.loads(msg.value().decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    print(f"  [KAFKA] Skipping malformed message: {e}")
+                    self.consumer.commit(asynchronous=False)
+                    continue
+
                 asset  = data.get("coin") or data.get("asset")
                 price  = data.get("price")
                 volume = data.get("volume", 0)
