@@ -44,6 +44,7 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 import indicators as ind
 import ai_validator as ai
+from costs import edge_gate, costs_for
 
 load_dotenv()
 
@@ -795,9 +796,22 @@ class OvernightTrader:
             return
         if not atr or atr <= 0:
             return
-        if STOP_ATR_MULT * atr < 0.50:
-            print(f"  [SKIP] {asset} — ATR too small (${atr:.4f})")
+
+        # Post-cost edge gate. The old check was `STOP_ATR_MULT * atr < 0.50`,
+        # a DOLLAR floor: $0.50 against a $100,000 BTC price is 0.0005% and
+        # passed every trade ever generated. What matters is ATR as a FRACTION
+        # of price, because that is what has to clear the ~0.60% round-trip
+        # cost of fees plus spread. Below roughly 0.40% ATR the advertised
+        # 2:1 R:R is negative after costs no matter how good the signal is.
+        gate_ok, gate_reason, econ = edge_gate(
+            price, atr, STOP_ATR_MULT, TARGET_ATR_MULT,
+            is_crypto=asset in CRYPTO_ASSETS,
+        )
+        if not gate_ok:
+            print(f"  [COST SKIP] {asset} — {gate_reason}")
+            self.logger.log(f"SKIP {direction} {asset} | cost gate: {gate_reason}")
             return
+        print(f"  [EDGE OK] {asset} — {gate_reason}")
 
         is_crypto = asset in CRYPTO_ASSETS
         fg_ok, fg_reason = ai.fear_greed_filter(direction, is_crypto)
