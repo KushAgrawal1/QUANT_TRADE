@@ -2,3 +2,5 @@ confluent-kafka
 websocket-client
 alpaca-py
 python-dotenv
+anthropic
+requests
