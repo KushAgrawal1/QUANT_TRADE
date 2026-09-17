@@ -5,3 +5,4 @@ __pycache__/
 trading_log_*.txt
 .venv/
 venv/
+data/
