@@ -96,9 +96,16 @@ class SignalEngine:
         ema_up      = bool(e9 and e21 and e9 >= e21 * EMA_TOLERANCE)
         ema_dn      = bool(e9 and e21 and e9 < e21)
 
-        use_vwap  = vwap is not None
-        vwap_buy  = (price > vwap) if use_vwap else True
-        vwap_sell = (price < vwap) if use_vwap else True
+        # Stocks must confirm against VWAP and fail closed when it is
+        # unavailable. Crypto only applies VWAP if the caller supplies one.
+        if asset in STOCK_ASSETS:
+            vwap_buy  = bool(vwap and price > vwap)
+            vwap_sell = bool(vwap and price < vwap)
+        elif vwap is not None:
+            vwap_buy  = price > vwap
+            vwap_sell = price < vwap
+        else:
+            vwap_buy = vwap_sell = True
 
         if trend_ok and breakout_up and vol_ok and ema_up and vwap_buy:
             signal = "BUY"
