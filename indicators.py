@@ -6,7 +6,6 @@ causing ADX values to explode to 100-800+.
 Correct Wilder's formula seeds with sum/period (average), not raw sum.
 """
 
-import math
 
 
 def _ema_series(prices: list, period: int) -> list:
