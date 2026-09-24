@@ -11,6 +11,8 @@ import json
 import requests
 from datetime import datetime, timezone
 
+import strategy as st
+
 try:
     import anthropic
     _ANTHROPIC_INSTALLED = True
@@ -34,7 +36,7 @@ def get_fear_greed() -> tuple[int, str]:
     global _fg_cache
     now = datetime.now(timezone.utc)
     if (_fg_cache["updated"] is None or
-            (now - _fg_cache["updated"]).seconds > 1800):
+            (now - _fg_cache["updated"]).total_seconds() > 1800):
         try:
             resp = requests.get(
                 "https://api.alternative.me/fng/?limit=1", timeout=5
@@ -50,13 +52,19 @@ def get_fear_greed() -> tuple[int, str]:
     return _fg_cache["value"], _fg_cache["label"]
 
 
+def _is_long(signal: str) -> bool:
+    """The strategy emits 'BUY' but the trader passes 'LONG'. Accept both -
+    checking only one of them silently disabled the filter for the other."""
+    return signal in ("BUY", "LONG")
+
+
 def fear_greed_filter(signal: str, is_crypto: bool) -> tuple[bool, str]:
     if not is_crypto:
         return True, "stocks not F&G filtered"
     fg_val, fg_label = get_fear_greed()
-    if signal == "BUY" and fg_val <= 24:
+    if _is_long(signal) and fg_val <= 24:
         return False, f"Extreme Fear ({fg_val}) — skip long"
-    if signal == "BUY" and fg_val >= 76:
+    if _is_long(signal) and fg_val >= 76:
         return False, f"Extreme Greed ({fg_val}) — skip long"
     if signal == "SHORT" and fg_val <= 24:
         return False, f"Extreme Fear ({fg_val}) — skip short"
@@ -107,8 +115,14 @@ def validate_with_claude(
             for i, c in enumerate(recent_candles[-5:])
         ])
 
-        stop   = price - 1.5 * atr if signal == "LONG" else price + 1.5 * atr
-        target = price + 3.0 * atr if signal == "LONG" else price - 3.0 * atr
+        # Read the multiples at call time so the prompt always matches the
+        # strategy actually being traded.
+        stop_d   = st.STOP_ATR_MULT * atr
+        target_d = st.TARGET_ATR_MULT * atr
+        long_    = _is_long(signal)
+        stop     = price - stop_d   if long_ else price + stop_d
+        target   = price + target_d if long_ else price - target_d
+        gross_rr = st.TARGET_ATR_MULT / st.STOP_ATR_MULT
 
         prompt = f"""You are a quantitative trading signal validator.
 
@@ -125,7 +139,7 @@ Last 5 candles:
 
 Stop:   ${stop:.4f}
 Target: ${target:.4f}
-R:R = 2:1
+Gross R:R = {gross_rr:.1f}:1 (before fees and slippage)
 
 Is this a genuine breakout?
 
