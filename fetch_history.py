@@ -56,6 +56,7 @@ def fetch(pair: str, interval: int) -> list:
     raw = data["result"][key][:-1]   # drop the in-progress bar
 
     bars = [{
+        "time":   int(r[0]),
         "open":   float(r[1]),
         "high":   float(r[2]),
         "low":    float(r[3]),
@@ -70,6 +71,7 @@ def fetch(pair: str, interval: int) -> list:
     for i in range(0, len(bars) - group + 1, group):
         chunk = bars[i:i + group]
         out.append({
+            "time":   chunk[0]["time"],
             "open":   chunk[0]["open"],
             "high":   max(c["high"] for c in chunk),
             "low":    min(c["low"] for c in chunk),
@@ -97,7 +99,7 @@ def main():
             path = os.path.join(DATA_DIR, f"{asset}.csv")
             with open(path, "w", newline="") as f:
                 w = csv.DictWriter(
-                    f, fieldnames=["open", "high", "low", "close", "volume"]
+                    f, fieldnames=["time", "open", "high", "low", "close", "volume"]
                 )
                 w.writeheader()
                 w.writerows(bars)

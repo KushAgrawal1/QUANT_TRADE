@@ -27,12 +27,11 @@ Design notes that matter for trusting the output:
 
 import os
 import csv
-import json
 import argparse
 from dataclasses import dataclass, field
 
 import strategy as st
-from costs import costs_for, edge_gate, net_edge
+from costs import costs_for, edge_gate
 
 
 DATA_DIR = "data"
@@ -48,6 +47,7 @@ class Trade:
     target: float
     qty: float
     exit_idx: int = 0
+    exit_ts: float = 0.0   # bar timestamp of the exit (bar index if no time data)
     exit: float = 0.0
     pnl: float = 0.0
     fees: float = 0.0
@@ -58,6 +58,7 @@ class Trade:
 class Result:
     trades: list = field(default_factory=list)
     equity: list = field(default_factory=list)
+    blocked: int = 0   # entries rejected by the post-cost edge gate
 
     def summary(self, starting_capital: float) -> dict:
         n = len(self.trades)
@@ -99,13 +100,17 @@ def load_candles(asset: str) -> list:
     out = []
     with open(path) as f:
         for row in csv.DictReader(f):
-            out.append({
+            candle = {
                 "open":   float(row["open"]),
                 "high":   float(row["high"]),
                 "low":    float(row["low"]),
                 "close":  float(row["close"]),
                 "volume": float(row["volume"]),
-            })
+            }
+            # Older CSVs have no time column; fall back gracefully.
+            if row.get("time"):
+                candle["time"] = int(row["time"])
+            out.append(candle)
     return out
 
 
@@ -140,7 +145,11 @@ def run_asset(asset: str, candles: list, capital: float,
             exit_px, reason = None, ""
             # Pessimistic: if both are touched in one bar, assume the stop.
             if hit_stop:
-                exit_px, reason = t.stop, "STOP"
+                # If the bar GAPPED through the stop, the stop price never
+                # traded - you get the open, which is worse.
+                gapped = (min(t.stop, candle["open"]) if t.direction == "LONG"
+                          else max(t.stop, candle["open"]))
+                exit_px, reason = gapped, "STOP"
             elif hit_tgt:
                 exit_px, reason = t.target, "TARGET"
 
@@ -155,6 +164,7 @@ def run_asset(asset: str, candles: list, capital: float,
                     if apply_costs else 0.0
 
                 t.exit, t.exit_idx, t.reason = exit_px, i, reason
+                t.exit_ts = candle.get("time", i)
                 t.fees = fee
                 t.pnl  = gross - fee
                 equity += t.pnl
@@ -212,11 +222,27 @@ def run_asset(asset: str, candles: list, capital: float,
     return res
 
 
+def combine_trades(trades: list, capital: float) -> Result:
+    """
+    Merge trades from every asset into ONE chronological equity curve.
+
+    Trades are ordered by exit time. Concatenating per-asset lists instead
+    (all BTC trades, then all ETH trades, ...) produces an equity curve that
+    never existed, so the max drawdown computed from it is meaningless.
+    """
+    ordered = sorted(trades, key=lambda t: t.exit_ts)   # stable for ties
+    equity, curve = capital, []
+    for t in ordered:
+        equity += t.pnl
+        curve.append(equity)
+    return Result(trades=ordered, equity=curve)
+
+
 def run_all(stop_mult, target_mult, apply_costs=True, apply_edge_gate=True,
             capital=100_000.0, verbose=True) -> dict:
-    all_trades, all_equity = [], []
-    equity = capital
+    all_trades = []
     per_asset = {}
+    missing_time = False
 
     for asset in st.CRYPTO_ASSETS:
         candles = load_candles(asset)
@@ -227,18 +253,20 @@ def run_all(stop_mult, target_mult, apply_costs=True, apply_edge_gate=True,
         s = r.summary(capital)
         per_asset[asset] = s
         all_trades.extend(r.trades)
-        for t in r.trades:
-            equity += t.pnl
-            all_equity.append(equity)
+        missing_time = missing_time or "time" not in candles[0]
         if verbose and s["trades"]:
             print(f"  {asset:<5} {s['trades']:>4} trades | "
                   f"WR {s['win_rate']:>5.1f}% | "
                   f"PF {s['profit_factor']:>5.2f} | "
                   f"net ${s['net_pnl']:>+10,.2f} | "
                   f"fees ${s['fees']:>8,.2f} | "
-                  f"blocked {getattr(r, 'blocked', 0)}")
+                  f"blocked {r.blocked}")
 
-    combined = Result(trades=all_trades, equity=all_equity)
+    if verbose and missing_time:
+        print("  NOTE: CSVs have no time column, so trades are ordered by bar "
+              "index and combined drawdown is approximate.\n"
+              "        Re-run fetch_history.py to fix.")
+    combined = combine_trades(all_trades, capital)
     return {"combined": combined.summary(capital), "per_asset": per_asset}
 
 
