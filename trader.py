@@ -34,7 +34,6 @@ All fixes and improvements:
 import os
 import json
 import requests
-from collections import deque
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -42,9 +41,13 @@ from confluent_kafka import Consumer, KafkaError
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
-import indicators as ind
 import ai_validator as ai
-from costs import edge_gate, costs_for
+from strategy import (
+    SignalEngine, CRYPTO_ASSETS, STOCK_ASSETS, ALL_ASSETS,
+    CANDLES_NEEDED, ADX_EXIT_LEVEL,
+    STOP_ATR_MULT, TARGET_ATR_MULT,
+)
+from costs import edge_gate
 
 load_dotenv()
 
@@ -60,23 +63,10 @@ KAFKA_CONF = {
 
 TOPICS = ["crypto-trades", "stock-trades"]
 
-CRYPTO_ASSETS = ["BTC", "ETH", "SOL", "LTC", "BCH", "AAVE", "XMR"]
-STOCK_ASSETS  = ["AAPL", "NVDA", "TSLA", "AMZN"]
-ALL_ASSETS    = CRYPTO_ASSETS + STOCK_ASSETS
-
+# Strategy parameters (assets, indicator periods, ATR multiples) live in
+# strategy.py so the live trader and the backtester can never drift apart.
 CANDLE_MINUTES   = 3
-CANDLE_WINDOW    = 80
-CANDLES_NEEDED   = 30
 WARMUP_CANDLES   = 35
-
-DONCHIAN_PERIOD  = 15
-VOLUME_PERIOD    = 15
-VOLUME_THRESHOLD = 1.5
-ADX_THRESHOLD    = 25
-ADX_EXIT_LEVEL   = 20
-
-STOP_ATR_MULT    = 1.5
-TARGET_ATR_MULT  = 3.0
 
 RISK_PER_TRADE   = 0.01
 MAX_NOTIONAL     = 10_000.0
@@ -222,89 +212,6 @@ class VWAPTracker:
                 self.data[asset]["cum_pv"] / self.data[asset]["cum_vol"], 4
             )
         return None
-
-
-# ── Signal Engine ─────────────────────────────────────────────────────────────
-
-class SignalEngine:
-    def __init__(self):
-        self.closes  = {a: deque(maxlen=CANDLE_WINDOW) for a in ALL_ASSETS}
-        self.highs   = {a: deque(maxlen=CANDLE_WINDOW) for a in ALL_ASSETS}
-        self.lows    = {a: deque(maxlen=CANDLE_WINDOW) for a in ALL_ASSETS}
-        self.volumes = {a: deque(maxlen=CANDLE_WINDOW) for a in ALL_ASSETS}
-
-    def add_candle(self, asset: str, candle: dict):
-        self.closes[asset].append(candle["close"])
-        self.highs[asset].append(candle["high"])
-        self.lows[asset].append(candle["low"])
-        self.volumes[asset].append(candle.get("volume", 0))
-
-    def ready(self, asset: str) -> bool:
-        return len(self.closes[asset]) >= CANDLES_NEEDED
-
-    def collected(self, asset: str) -> int:
-        return len(self.closes[asset])
-
-    def recent_candles(self, asset: str) -> list:
-        closes = list(self.closes[asset])[-5:]
-        highs  = list(self.highs[asset])[-5:]
-        lows   = list(self.lows[asset])[-5:]
-        return [{"open": closes[i], "high": highs[i],
-                 "low": lows[i], "close": closes[i]}
-                for i in range(len(closes))]
-
-    def analyse(self, asset: str, price: float,
-                vwap: float | None = None) -> tuple:
-        closes  = list(self.closes[asset])
-        highs   = list(self.highs[asset])
-        lows    = list(self.lows[asset])
-        volumes = list(self.volumes[asset])
-
-        adx_val, adx_rising = ind.adx(highs, lows, closes)
-        don_high, don_low   = ind.donchian_channel(
-            highs[:-1], lows[:-1], period=DONCHIAN_PERIOD
-        )
-        vol_r    = ind.volume_ratio(volumes, period=VOLUME_PERIOD)
-        e9       = ind.ema(closes, 9)
-        e21      = ind.ema(closes, 21)
-        atr_val  = ind.atr(highs, lows, closes)
-
-        trend_ok    = bool(adx_val and adx_val > ADX_THRESHOLD and adx_rising)
-        breakout_up = bool(don_high and price > don_high)
-        breakout_dn = bool(don_low  and price < don_low)
-        vol_ok      = bool(vol_r and vol_r >= VOLUME_THRESHOLD)
-        ema_up      = bool(e9 and e21 and e9 >= e21 * 0.995)
-        ema_dn      = bool(e9 and e21 and e9 < e21)
-
-        above_vwap = bool(vwap and price > vwap)
-        below_vwap = bool(vwap and price < vwap)
-        vwap_buy   = (above_vwap if asset in STOCK_ASSETS else True)
-        vwap_sell  = (below_vwap if asset in STOCK_ASSETS else True)
-
-        if trend_ok and breakout_up and vol_ok and ema_up and vwap_buy:
-            signal = "BUY"
-        elif (asset in STOCK_ASSETS and
-              trend_ok and breakout_dn and vol_ok and ema_dn and vwap_sell):
-            signal = "SHORT"
-        else:
-            signal = "HOLD"
-
-        return signal, {
-            "adx": adx_val, "adx_up": adx_rising,
-            "don_high": don_high, "don_low": don_low,
-            "vol_ratio": vol_r, "atr": atr_val,
-            "trend_ok": trend_ok,
-            "breakout": breakout_up or breakout_dn,
-            "vol_ok":   vol_ok,
-            "ema_ok":   ema_up or ema_dn,
-        }
-
-    def adx_value(self, asset: str) -> float | None:
-        closes = list(self.closes[asset])
-        highs  = list(self.highs[asset])
-        lows   = list(self.lows[asset])
-        val, _ = ind.adx(highs, lows, closes)
-        return val
 
 
 # ── Trade Manager ─────────────────────────────────────────────────────────────
