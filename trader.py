@@ -12,7 +12,9 @@ All fixes and improvements:
      No more manually updating INITIAL_CAPITAL after each session.
 
   3. SELL QTY FIX
-     _close() passes qty=0, _place() fetches real Alpaca position qty.
+     close_position() always fetches the real Alpaca position qty rather
+     than trusting our own bookkeeping (open_position/close_position have
+     explicit intent, since a SHORT's closing side is a BUY, not a SELL).
      Eliminates "insufficient balance" errors permanently.
 
   4. WIN/LOSS COOLDOWNS
@@ -233,9 +235,10 @@ class TradeManager:
             "be_trigger": be_trig, "atr": atr,
             "direction": direction, "stage": 0,
         }
+        rr = TARGET_ATR_MULT / STOP_ATR_MULT if STOP_ATR_MULT else float("inf")
         print(
             f"  [SET] {asset} {direction} | entry=${entry:,.4f} | "
-            f"stop=${stop:,.4f} | target=${target:,.4f} | R:R=2:1"
+            f"stop=${stop:,.4f} | target=${target:,.4f} | R:R={rr:.1f}:1"
         )
 
     def update_breakeven(self, asset: str, price: float):
@@ -337,9 +340,9 @@ class Portfolio:
 
     def can_open(self, asset: str) -> tuple[bool, str]:
         if self.is_paused():
-            remaining = (
-                self.pause_until - datetime.now(timezone.utc)
-            ).seconds // 60
+            remaining = int(
+                (self.pause_until - datetime.now(timezone.utc)).total_seconds()
+            ) // 60
             return False, f"paused ({remaining}min left)"
         if self.has(asset):
             return False, "in position"
@@ -348,6 +351,8 @@ class Portfolio:
         cd = self.cooldowns.get(asset, CANDLE_COOLDOWN)
         if self.last_result.get(asset) == "LOSS" and cd < LOSS_COOLDOWN:
             return False, f"loss cooldown ({LOSS_COOLDOWN - cd} candles)"
+        if self.last_result.get(asset) == "WIN" and cd < WIN_COOLDOWN:
+            return False, f"win cooldown ({WIN_COOLDOWN - cd} candles)"
         if cd < CANDLE_COOLDOWN:
             return False, f"cooldown ({CANDLE_COOLDOWN - cd})"
         return True, "ok"
@@ -391,7 +396,7 @@ class Portfolio:
             self.wins              += 1
             self.consecutive_loss   = 0
             self.last_result[asset] = "WIN"
-            self.cooldowns[asset]   = WIN_COOLDOWN
+            self.cooldowns[asset]   = 0   # counts UP each candle, gated above
         else:
             self.losses            += 1
             self.consecutive_loss  += 1
@@ -502,36 +507,41 @@ class AlpacaExecutor:
         except Exception as e:
             print(f"  [STARTUP CLEANUP] Error: {e}\n")
 
-    def _place(self, asset: str, qty: float, side: OrderSide) -> bool:
+    def _place(self, asset: str, qty: float, side: OrderSide,
+               fetch_qty: bool) -> bool:
         """
-        For SELL orders: always fetch actual Alpaca position qty.
-        Alpaca fills buys at slightly different qty (e.g. 78.6817 vs 78.8394).
-        Using our stored qty for sells causes "insufficient balance".
-        Fetching real qty eliminates this permanently.
+        fetch_qty=True means "close a position": always fetch the actual
+        Alpaca qty instead of trusting our own bookkeeping. Alpaca fills
+        buys at a slightly different qty than requested (e.g. 78.6817 vs
+        78.8394), and for a SHORT the closing side is a BUY, so this can no
+        longer be inferred from side == SELL - it must be passed explicitly.
         """
         try:
             tif = TimeInForce.DAY if asset in STOCK_ASSETS else TimeInForce.GTC
 
-            if side == OrderSide.SELL:
+            if fetch_qty:
                 try:
                     position = self.client.get_open_position(
                         to_alpaca_symbol(asset)
                     )
-                    safe_qty = floor_qty(float(position.qty))
+                    safe_qty = floor_qty(abs(float(position.qty)))
                     if safe_qty <= 0:
                         print(
                             f"  [ALPACA] No position for {asset} "
-                            f"— skipping sell"
+                            f"— skipping close"
                         )
                         return True
                 except Exception:
                     print(
                         f"  [ALPACA] Position not found for {asset} "
-                        f"— skipping sell"
+                        f"— skipping close"
                     )
                     return True
             else:
                 safe_qty = floor_qty(qty)
+                if safe_qty <= 0:
+                    print(f"  [ALPACA] Zero quantity for {asset} — skipping order")
+                    return False
 
             order = MarketOrderRequest(
                 symbol=to_alpaca_symbol(asset),
@@ -550,11 +560,17 @@ class AlpacaExecutor:
             print(f"  [ALPACA ERROR] {side.value} {asset}: {e}")
             return False
 
-    def buy(self, asset: str, qty: float) -> bool:
-        return self._place(asset, qty, OrderSide.BUY)
+    def open_position(self, asset: str, qty: float, direction: str) -> bool:
+        """Opening a LONG is a BUY, opening a SHORT is a SELL. Always uses
+        our own computed qty - there is no existing position to fetch."""
+        side = OrderSide.BUY if direction == "LONG" else OrderSide.SELL
+        return self._place(asset, qty, side, fetch_qty=False)
 
-    def sell(self, asset: str, qty: float) -> bool:
-        return self._place(asset, qty, OrderSide.SELL)
+    def close_position(self, asset: str, direction: str) -> bool:
+        """Closing a LONG is a SELL, closing a SHORT is a BUY. Fetches the
+        real Alpaca qty rather than trusting our own bookkeeping."""
+        side = OrderSide.SELL if direction == "LONG" else OrderSide.BUY
+        return self._place(asset, 0, side, fetch_qty=True)
 
 
 # ── Instant Warmup ────────────────────────────────────────────────────────────
@@ -760,19 +776,24 @@ class OvernightTrader:
         if qty <= 0:
             return
 
-        side = OrderSide.BUY if direction == "LONG" else OrderSide.SELL
-        if self.alpaca._place(asset, qty, side):
+        if self.alpaca.open_position(asset, qty, direction):
             self.portfolio.open(asset, qty, price, atr, direction)
             self.trades.open(asset, price, atr, direction)
+        else:
+            print(f"  [SKIP] {asset} order failed — not opening internally")
 
     def _close(self, asset: str, price: float, reason: str):
         if not self.portfolio.has(asset):
             return
         direction = self.trades.direction(asset)
+        if not self.alpaca.close_position(asset, direction):
+            # The real order failed - keep our internal state open so this
+            # exit is retried on the next tick instead of us losing track
+            # of a position Alpaca still holds.
+            print(f"  [CLOSE FAILED] {asset} — will retry")
+            return
         self.portfolio.close(asset, price, reason)
         self.trades.clear(asset)
-        side = OrderSide.SELL if direction == "LONG" else OrderSide.BUY
-        self.alpaca._place(asset, 0, side)
 
     def _close_stocks_at_market_close(self):
         if is_us_market_hours():
