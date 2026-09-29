@@ -55,36 +55,54 @@ def on_open(ws):
     }))
 
 
-def on_message(ws, raw):
-    data = json.loads(raw)
+def parse_kraken_message(data) -> list:
+    """Pure: one decoded Kraken WS message -> zero or more Kafka-ready
+    event dicts. Non-trade messages and unrecognised shapes return an
+    empty list rather than raising, and one malformed trade inside an
+    otherwise-good batch is skipped individually - so one odd message
+    from Kraken never has to tear down the whole connection.
+    """
+    if not (isinstance(data, list) and len(data) == 4 and data[2] == "trade"):
+        return []
 
-    if isinstance(data, dict):
-        if data.get("event") == "subscriptionStatus":
-            status = data.get("status")
-            pair   = data.get("pair", "")
-            if status == "subscribed":
-                print(f"  ✓ {pair}")
-        return
-
-    if len(data) == 4 and data[2] == "trade":
-        pair = data[3]
-        coin = PAIR_TO_COIN.get(pair, pair)
-        for trade in data[1]:
-            event = {
+    pair = data[3]
+    coin = PAIR_TO_COIN.get(pair, pair)
+    events = []
+    for trade in data[1]:
+        try:
+            events.append({
                 "coin":        coin,
                 "price":       float(trade[0]),
                 "volume":      float(trade[1]),
                 "timestamp":   trade[2],
                 "side":        "buy" if trade[3] == "b" else "sell",
                 "asset_class": "crypto",
-            }
-            producer.produce(
-                topic=TOPIC,
-                key=coin,
-                value=json.dumps(event).encode("utf-8"),
-                callback=on_delivery,
-            )
-            producer.poll(0)
+            })
+        except (IndexError, TypeError, ValueError) as e:
+            print(f"  [SKIP] malformed trade in {pair}: {e}")
+    return events
+
+
+def on_message(ws, raw):
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"  [SKIP] unparseable message: {e}")
+        return
+
+    if isinstance(data, dict):
+        if data.get("event") == "subscriptionStatus" and data.get("status") == "subscribed":
+            print(f"  ✓ {data.get('pair', '')}")
+        return
+
+    for event in parse_kraken_message(data):
+        producer.produce(
+            topic=TOPIC,
+            key=event["coin"],
+            value=json.dumps(event).encode("utf-8"),
+            callback=on_delivery,
+        )
+        producer.poll(0)
 
 
 def on_error(ws, error):
