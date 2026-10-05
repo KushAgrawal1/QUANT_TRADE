@@ -85,7 +85,7 @@ def test_can_open_blocks_during_loss_cooldown():
     ok, reason = p.can_open("BTC")
     assert not ok and "loss cooldown" in reason
     for _ in range(tr.LOSS_COOLDOWN):
-        p.tick_cooldowns()
+        p.tick_cooldowns("BTC")
     assert p.can_open("BTC")[0] is True
 
 
@@ -100,7 +100,7 @@ def test_can_open_blocks_during_win_cooldown_then_clears():
     ok, reason = p.can_open("BTC")
     assert not ok and "win cooldown" in reason
     for _ in range(tr.WIN_COOLDOWN):
-        p.tick_cooldowns()
+        p.tick_cooldowns("BTC")
     assert p.can_open("BTC")[0] is True
 
 
@@ -144,6 +144,36 @@ def test_a_win_resets_the_consecutive_loss_streak():
     p.open("ETH", 1.0, 100.0, 2.0, "LONG")
     p.close("ETH", 110.0, "TARGET")
     assert p.consecutive_loss == 0
+
+
+def test_tick_cooldowns_only_advances_the_given_assets_own_counter():
+    """Regression: tick_cooldowns() used to take no argument and bump every
+    asset's counter on every call. CandleBuilder buckets all assets on the
+    same wall-clock grid, so every actively-ticking asset's candle
+    completes within moments of every other one at each 3-minute boundary
+    - with an 11-asset universe, that burned a 30-real-minute loss cooldown
+    down in about 3 real minutes, because BTC's counter advanced every
+    time ANY other asset's candle completed too."""
+    p = _pf()
+    p.open("BTC", 1.0, 100.0, 2.0, "LONG")
+    p.close("BTC", 90.0, "STOP")
+    assert p.cooldowns["BTC"] == 0
+
+    # a full 3-minute block where 10 OTHER assets' candles complete first
+    for other in ["ETH", "SOL", "LTC", "BCH", "AAVE", "XMR", "AAPL", "NVDA", "TSLA", "AMZN"]:
+        p.tick_cooldowns(other)
+
+    assert p.cooldowns["BTC"] == 0   # unaffected by every other asset
+    assert p.can_open("BTC")[0] is False   # still in loss cooldown
+
+    p.tick_cooldowns("BTC")
+    assert p.cooldowns["BTC"] == 1
+
+
+def test_tick_cooldowns_ignores_an_asset_with_no_recorded_cooldown():
+    p = _pf()
+    p.tick_cooldowns("BTC")   # BTC has never closed a trade - nothing to advance
+    assert "BTC" not in p.cooldowns
 
 
 def test_can_open_reports_remaining_pause_minutes_correctly():

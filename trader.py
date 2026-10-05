@@ -316,9 +316,20 @@ class Portfolio:
     def qty(self, asset: str) -> float:
         return self.positions.get(asset, {}).get("qty", 0)
 
-    def tick_cooldowns(self):
-        for a in list(self.cooldowns):
-            self.cooldowns[a] += 1
+    def tick_cooldowns(self, asset: str):
+        """Advance ONLY this asset's own cooldown counter by one candle.
+
+        CandleBuilder buckets every asset on the same absolute wall-clock
+        grid, so when a 3-minute block ends, every actively-ticking asset
+        completes a candle within moments of each other - this is called
+        once per asset's own completion, not once per elapsed block. A
+        version that bumped every asset's counter on every call (as this
+        used to) let an 11-asset universe burn through a 30-real-minute
+        loss cooldown in about 3 real minutes, since BTC's counter got
+        incremented every time ANY other asset's candle also completed.
+        """
+        if asset in self.cooldowns:
+            self.cooldowns[asset] += 1
 
     def is_paused(self) -> bool:
         if self.pause_until is None:
@@ -883,7 +894,7 @@ class OvernightTrader:
 
                 self.engine.add_candle(asset, completed)
                 vwap_val = self.vwap.update(asset, completed)
-                self.portfolio.tick_cooldowns()
+                self.portfolio.tick_cooldowns(asset)
                 self._close_stocks_at_market_close()
 
                 if not self.engine.ready(asset):
