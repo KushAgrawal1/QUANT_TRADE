@@ -6,3 +6,10 @@ trading_log_*.txt
 .venv/
 venv/
 data/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.venv/
+logs/
+trading_log_*.txt
